@@ -4056,6 +4056,35 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    // Fish S2 Phase 1S: exact K-cache ROPE -> ROUND_BF16 -> VIEW -> SET_ROWS fusion.
+    // Preserve the explicit F32->BF16->F32 boundary before writing the accepted F16 cache.
+    if (getenv("FISH_PHASE1S_ROPE_BF16_SET_ROWS_FUSION") != nullptr && i + 3 < cgraph->n_nodes) {
+        ggml_tensor * rope     = cgraph->nodes[i];
+        ggml_tensor * round    = cgraph->nodes[i + 1];
+        ggml_tensor * view     = cgraph->nodes[i + 2];
+        ggml_tensor * set_rows = cgraph->nodes[i + 3];
+        const int mode = rope->op == GGML_OP_ROPE ? ((const int32_t *) rope->op_params)[2] : -1;
+
+        if (rope->op == GGML_OP_ROPE && rope->src[0] != nullptr && rope->src[0]->type == GGML_TYPE_F32 &&
+            rope->type == GGML_TYPE_F32 && rope->src[0]->ne[3] == 1 && mode == GGML_ROPE_TYPE_NORMAL &&
+            round->op == GGML_OP_UNARY && round->src[0] == rope &&
+            ggml_get_unary_op(round) == GGML_UNARY_OP_ROUND_BF16 && round->type == GGML_TYPE_F32 &&
+            ggml_nelements(round) == 1024 &&
+            view->op == GGML_OP_VIEW && view->src[0] == round && view->type == GGML_TYPE_F32 &&
+            ggml_is_contiguous(view) && view->ne[0] == round->ne[0] * round->ne[1] &&
+            set_rows->op == GGML_OP_SET_ROWS && set_rows->src[0] == view &&
+            set_rows->src[1] != nullptr && set_rows->src[1]->type == GGML_TYPE_I32 &&
+            set_rows->src[2] != nullptr && set_rows->src[2]->type == GGML_TYPE_F16 &&
+            set_rows->type == GGML_TYPE_F16 &&
+            !(rope->flags & GGML_TENSOR_FLAG_OUTPUT) && !(round->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+            !(view->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+            ggml_can_fuse_subgraph(cgraph, i,
+                { GGML_OP_ROPE, GGML_OP_UNARY, GGML_OP_VIEW, GGML_OP_SET_ROWS }, { i + 3 })) {
+            ggml_cuda_op_rope_bf16_set_rows_fused(*cuda_ctx, rope, set_rows);
+            return 3;
+        }
+    }
+
     // Fish S2 Phase 1Q: recurrent residual ROUND_BF16 -> ADD fusion.
     // The narrow gate only accepts ADD dst == ROUND output. The full gate also
     // accepts ADD dst == ADD src0, which is safe for this same-shape elementwise
