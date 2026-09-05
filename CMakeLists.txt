@@ -905,6 +905,22 @@ audiocpp_add_model(fish_audio
         engine::models::fish_audio::make_fish_audio_loader
 )
 
+if (ENGINE_ENABLE_HIP)
+    find_program(AUDIOCPP_HIPCC hipcc REQUIRED)
+    set(AUDIOCPP_FISH_HIP_FAST_SAMPLER_OBJ "${CMAKE_CURRENT_BINARY_DIR}/fish_hip_fast_sampler.o")
+    add_custom_command(
+        OUTPUT ${AUDIOCPP_FISH_HIP_FAST_SAMPLER_OBJ}
+        COMMAND ${AUDIOCPP_HIPCC} -O3 -fPIC --offload-arch=${GPU_TARGETS} -std=c++17
+            -c ${CMAKE_CURRENT_SOURCE_DIR}/src/models/fish_audio/hip_fast_sampler.cu
+            -o ${AUDIOCPP_FISH_HIP_FAST_SAMPLER_OBJ}
+        DEPENDS
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/models/fish_audio/hip_fast_sampler.cu
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/models/fish_audio/hip_fast_sampler.h
+        VERBATIM)
+    set_source_files_properties(${AUDIOCPP_FISH_HIP_FAST_SAMPLER_OBJ} PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
+    target_compile_definitions(engine_model_fish_audio PRIVATE ENGINE_HAS_HIP_FISH_FAST_SAMPLER=1)
+endif()
+
 audiocpp_add_model(magpie_tts
     SOURCES
         src/models/magpie_tts/assets.cpp
@@ -1565,6 +1581,12 @@ add_executable(audiocpp_cli
 )
 
 target_link_libraries(audiocpp_cli PRIVATE engine_runtime ggml)
+if (ENGINE_ENABLE_HIP AND UNIX AND NOT APPLE)
+    target_link_options(audiocpp_cli PRIVATE -no-pie)
+endif()
+if (ENGINE_ENABLE_HIP)
+    target_sources(audiocpp_cli PRIVATE ${AUDIOCPP_FISH_HIP_FAST_SAMPLER_OBJ})
+endif()
 # MinGW selects the wmain() entry point only when linked with -municode;
 # without it the CLI fails to link (undefined reference / ld error 5).
 # MSVC detects wmain natively, so this is MinGW-only. Link option only:
