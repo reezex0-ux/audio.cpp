@@ -4109,6 +4109,59 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // Fish S2 Phase 1R: PackedGateUp exact BF16 SwiGLU. The real graph is
+    // VIEW(gate) -> ROUND_BF16 -> SILU -> ROUND_BF16, then VIEW(up) ->
+    // ROUND_BF16, followed by MUL. Both views share the same packed F32
+    // projection source. Reproduce all three BF16 boundaries in one kernel and
+    // leave the post-MUL round to the already-accepted Q8 input fusion.
+    if (getenv("FISH_PHASE1R_PACKED_BF16_SWIGLU") != nullptr && i > 0 && i + 5 < cgraph->n_nodes) {
+        ggml_tensor * gate_view  = cgraph->nodes[i - 1];
+        ggml_tensor * gate_round = cgraph->nodes[i];
+        ggml_tensor * silu       = cgraph->nodes[i + 1];
+        ggml_tensor * silu_round = cgraph->nodes[i + 2];
+        ggml_tensor * up_view    = cgraph->nodes[i + 3];
+        ggml_tensor * up_round   = cgraph->nodes[i + 4];
+        ggml_tensor * mul        = cgraph->nodes[i + 5];
+        const int out_nodes[] = { i + 5 };
+
+        if (gate_view->op == GGML_OP_VIEW && gate_view->src[0] != nullptr &&
+            gate_round->op == GGML_OP_UNARY && gate_round->src[0] == gate_view &&
+            ggml_get_unary_op(gate_round) == GGML_UNARY_OP_ROUND_BF16 &&
+            silu->op == GGML_OP_UNARY && silu->src[0] == gate_round &&
+            ggml_get_unary_op(silu) == GGML_UNARY_OP_SILU &&
+            silu_round->op == GGML_OP_UNARY && silu_round->src[0] == silu &&
+            ggml_get_unary_op(silu_round) == GGML_UNARY_OP_ROUND_BF16 &&
+            up_view->op == GGML_OP_VIEW && up_view->src[0] == gate_view->src[0] &&
+            up_round->op == GGML_OP_UNARY && up_round->src[0] == up_view &&
+            ggml_get_unary_op(up_round) == GGML_UNARY_OP_ROUND_BF16 &&
+            mul->op == GGML_OP_MUL && mul->src[0] == silu_round && mul->src[1] == up_round &&
+            gate_view->type == GGML_TYPE_F32 && up_view->type == GGML_TYPE_F32 &&
+            gate_round->type == GGML_TYPE_F32 && silu->type == GGML_TYPE_F32 &&
+            silu_round->type == GGML_TYPE_F32 && up_round->type == GGML_TYPE_F32 &&
+            mul->type == GGML_TYPE_F32 &&
+            ggml_nelements(gate_view) == 9728 &&
+            ggml_nelements(gate_view) == ggml_nelements(up_view) &&
+            ggml_nelements(gate_view) == ggml_nelements(mul) &&
+            ggml_nelements(gate_view->src[0]) == 2 * ggml_nelements(gate_view) &&
+            ggml_is_contiguous(gate_view) && ggml_is_contiguous(up_view) && ggml_is_contiguous(mul) &&
+            ggml_node_get_use_count(cgraph, i - 1) == 1 &&
+            ggml_node_get_use_count(cgraph, i) == 1 &&
+            ggml_node_get_use_count(cgraph, i + 1) == 1 &&
+            ggml_node_get_use_count(cgraph, i + 2) == 1 &&
+            ggml_node_get_use_count(cgraph, i + 3) == 1 &&
+            ggml_node_get_use_count(cgraph, i + 4) == 1 &&
+            !(gate_view->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+            !(gate_round->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+            !(silu->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+            !(silu_round->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+            !(up_view->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+            !(up_round->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+            ggml_cuda_check_fusion_memory_ranges(cgraph, i, 6, out_nodes, 1)) {
+            ggml_cuda_op_swiglu_bf16_rounds(*cuda_ctx, gate_view, up_view, mul);
+            return 5;
+        }
+    }
+
     //topk-moe
     if (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||
             cgraph->nodes[i]->op == GGML_OP_ARGSORT) {

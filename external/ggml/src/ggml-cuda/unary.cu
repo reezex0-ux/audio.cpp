@@ -704,6 +704,51 @@ static void ggml_cuda_op_unary_mul_impl(ggml_backend_cuda_context & ctx, ggml_te
     }
 }
 
+// Fish S2 Phase 1R: exact packed-MLP gate/up path. The source views are the
+// unrounded F32 halves of PackedGateUp. Reproduce the activation-cast policy
+// exactly at projection and post-SiLU boundaries, then write the ordinary MUL
+// result. A following ROUND_BF16 remains available to the accepted Q8 input
+// fusion, so this kernel must not round the product itself.
+static __global__ void swiglu_bf16_rounds_kernel(
+        const float * __restrict__ gate_pre_round,
+        const float * __restrict__ up_pre_round,
+        float * __restrict__ dst,
+        const int64_t k) {
+    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+    if (i >= k) {
+        return;
+    }
+
+    const float gate = op_round_bf16(gate_pre_round[i]);
+    const float silu = op_round_bf16(ggml_cuda_op_silu_single(gate));
+    const float up   = op_round_bf16(up_pre_round[i]);
+    dst[i] = silu * up;
+}
+
+void ggml_cuda_op_swiglu_bf16_rounds(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * gate_pre_round,
+        const ggml_tensor * up_pre_round,
+        ggml_tensor * dst) {
+    GGML_ASSERT(gate_pre_round != nullptr && up_pre_round != nullptr && dst != nullptr);
+    GGML_ASSERT(gate_pre_round->type == GGML_TYPE_F32);
+    GGML_ASSERT(up_pre_round->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(gate_pre_round, up_pre_round));
+    GGML_ASSERT(ggml_are_same_shape(gate_pre_round, dst));
+    GGML_ASSERT(ggml_is_contiguous(gate_pre_round));
+    GGML_ASSERT(ggml_is_contiguous(up_pre_round));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int64_t k = ggml_nelements(dst);
+    const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
+    swiglu_bf16_rounds_kernel<<<num_blocks, CUDA_GLU_BLOCK_SIZE, 0, ctx.stream()>>>(
+        (const float *) gate_pre_round->data,
+        (const float *) up_pre_round->data,
+        (float *) dst->data,
+        k);
+}
+
 void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node) {
     switch (ggml_get_unary_op(unary_node)) {
         case GGML_UNARY_OP_SILU:
