@@ -591,6 +591,9 @@ static __global__ void mul_mat_vec_q(
                     }
                 }
             }
+            if (fusion.round_bf16_output) {
+                result = __bfloat162float(__float2bfloat16(result));
+            }
             dst[j*stride_col_dst + threadIdx.x] = result;
         }
     }
@@ -1097,6 +1100,7 @@ void ggml_cuda_mul_mat_vec_q(
         }
         fusion_local.glu_op = fusion->glu_op;
         fusion_local.residual_only = fusion->residual_only;
+        fusion_local.round_bf16_output = fusion->round_bf16_output;
     }
 
     // If src0 is a temporary compute buffer, clear any potential padding.

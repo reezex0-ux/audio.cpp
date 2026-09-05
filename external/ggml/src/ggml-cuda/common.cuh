@@ -1533,6 +1533,7 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * gate_bias = nullptr;
     ggml_glu_op glu_op;
     bool residual_only = false;
+    bool round_bf16_output = false;
 };
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
@@ -1540,4 +1541,5 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * gate_bias = nullptr;
     ggml_glu_op glu_op;
     bool residual_only = false;
+    bool round_bf16_output = false;
 };

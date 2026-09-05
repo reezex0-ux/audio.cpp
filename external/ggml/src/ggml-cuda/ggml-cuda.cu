@@ -4345,6 +4345,38 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     fused_mul_mat_vec = false;
     fused_node_count  = 0;
 
+    // Fish S2 experimental exact fusion: preserve the existing Q8_0 MMV
+    // reduction order, but round the final scalar to BF16-valued F32 before
+    // storing it. This is numerically identical to a following ROUND_BF16 op
+    // while avoiding that extra kernel launch.
+    if (getenv("FISH_PHASE1N_Q8_ROUND_FUSION") != nullptr && i + 2 < cgraph->n_nodes) {
+        ggml_tensor * mm_node = cgraph->nodes[i];
+        ggml_tensor * reshape_node = cgraph->nodes[i + 1];
+        ggml_tensor * round_node = cgraph->nodes[i + 2];
+        const int out_nodes[] = { i + 2 };
+        if (mm_node->op == GGML_OP_MUL_MAT &&
+            reshape_node->op == GGML_OP_RESHAPE &&
+            reshape_node->src[0] == mm_node &&
+            round_node->op == GGML_OP_UNARY &&
+            round_node->src[0] == reshape_node &&
+            ggml_get_unary_op(round_node) == GGML_UNARY_OP_ROUND_BF16 &&
+            mm_node->src[0]->type == GGML_TYPE_Q8_0 &&
+            ggml_nelements(mm_node) == ggml_nelements(reshape_node) &&
+            ggml_nelements(reshape_node) == ggml_nelements(round_node) &&
+            ggml_node_get_use_count(cgraph, i) == 1 &&
+            ggml_node_get_use_count(cgraph, i + 1) == 1 &&
+            !(mm_node->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+            !(reshape_node->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+            ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, out_nodes, 1) &&
+            ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
+            ggml_cuda_mm_fusion_args_host fusion_data{};
+            fusion_data.round_bf16_output = true;
+            ggml_cuda_mul_mat_vec_q(
+                *cuda_ctx, mm_node->src[0], mm_node->src[1], mm_node->src[2], round_node, &fusion_data);
+            return 2;
+        }
+    }
+
     // mul_mat + optional metadata-only reshape + add
     for (ggml_op op : { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID }) {
         const ggml_op bias_op = op == GGML_OP_MUL_MAT ? GGML_OP_ADD : GGML_OP_ADD_ID;
