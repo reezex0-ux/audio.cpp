@@ -11,6 +11,19 @@ static __device__ __forceinline__ float op_add(const float a, const float b) {
     return a + b;
 }
 
+static __device__ __forceinline__ float op_add_round_bf16_rhs(const float a, const float b) {
+    uint32_t bits = __float_as_uint(b);
+    const uint32_t exp = bits & 0x7f800000u;
+    const uint32_t mantissa = bits & 0x007fffffu;
+    if (exp != 0x7f800000u) {
+        bits += 0x00007fffu + ((bits >> 16) & 1u);
+        bits &= 0xffff0000u;
+    } else if (mantissa != 0) {
+        bits = (bits & 0xffff0000u) | 0x00010000u;
+    }
+    return a + __uint_as_float(bits);
+}
+
 static __device__ __forceinline__ float op_sub(const float a, const float b) {
     return a - b;
 }
@@ -528,6 +541,20 @@ void ggml_cuda_op_add(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         return;
     }
     ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_add>>(dst->src[0], dst->src[1], dst, dst->src[0]->data, dst->src[1]->data, dst->data, ctx.stream());
+}
+
+void ggml_cuda_op_add_round_bf16_rhs(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0,
+        const ggml_tensor * rhs_pre_round,
+        ggml_tensor * dst) {
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(rhs_pre_round->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(src0, dst));
+    GGML_ASSERT(ggml_are_same_shape(rhs_pre_round, dst));
+    ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_add_round_bf16_rhs, 0>>(
+        src0, rhs_pre_round, dst, src0->data, rhs_pre_round->data, dst->data, ctx.stream());
 }
 
 void ggml_cuda_op_sub(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

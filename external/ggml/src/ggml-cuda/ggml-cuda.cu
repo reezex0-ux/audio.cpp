@@ -4056,6 +4056,39 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    // Fish S2 Phase 1Q: recurrent residual ROUND_BF16 -> ADD fusion.
+    // Only the first-layer allocator pattern is safe here: ADD dst aliases the
+    // ROUND output, while ADD src0 is disjoint. Explicit pre-round RHS requires
+    // bin_bcast n_fuse=0; n_fuse=1 silently rereads dst->src[1].
+    if (getenv("FISH_PHASE1Q_SAFE_RESIDUAL_ADD_ROUND_FUSION") != nullptr && i > 0 && i + 1 < cgraph->n_nodes) {
+        ggml_tensor * reshape_node = cgraph->nodes[i - 1];
+        ggml_tensor * round_node   = cgraph->nodes[i];
+        ggml_tensor * add_node     = cgraph->nodes[i + 1];
+        if (reshape_node->op == GGML_OP_RESHAPE &&
+            round_node->op == GGML_OP_UNARY && round_node->src[0] == reshape_node &&
+            ggml_get_unary_op(round_node) == GGML_UNARY_OP_ROUND_BF16 &&
+            add_node->op == GGML_OP_ADD && add_node->src[1] == round_node &&
+            reshape_node->src[0] && reshape_node->type == GGML_TYPE_F32 &&
+            reshape_node->src[0]->type == GGML_TYPE_F32 && round_node->type == GGML_TYPE_F32 &&
+            add_node->src[0] && add_node->src[0]->type == GGML_TYPE_F32 && add_node->type == GGML_TYPE_F32 &&
+            ggml_nelements(round_node) == 2560 &&
+            ggml_nelements(reshape_node) == ggml_nelements(round_node) &&
+            ggml_nelements(round_node) == ggml_nelements(add_node) &&
+            ggml_is_contiguous(reshape_node) && ggml_is_contiguous(round_node) &&
+            ggml_is_contiguous(add_node->src[0]) && ggml_is_contiguous(add_node) &&
+            ggml_node_get_use_count(cgraph, i - 1) == 1 &&
+            ggml_node_get_use_count(cgraph, i) == 1 &&
+            !(reshape_node->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+            !(round_node->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+            add_node->data == round_node->data && add_node->buffer == round_node->buffer) {
+            const int out_nodes[] = { i + 1 };
+            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, out_nodes, 1)) {
+                ggml_cuda_op_add_round_bf16_rhs(*cuda_ctx, add_node->src[0], reshape_node, add_node);
+                return 1;
+            }
+        }
+    }
+
     //topk-moe
     if (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||
             cgraph->nodes[i]->op == GGML_OP_ARGSORT) {
