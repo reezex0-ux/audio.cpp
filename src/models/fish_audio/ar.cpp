@@ -149,6 +149,7 @@ modules::QwenDecoderActivationCastPolicy fish_activation_cast_policy(core::Backe
     // cast-to-BF16 + cast-back-to-F32, while avoiding the intermediate tensor
     // and one kernel launch at every activation-rounding boundary.
     policy.fused_round = backend_type == core::BackendType::Hip;
+    policy.round_packed_qkv_projection = backend_type == core::BackendType::Hip;
     policy.after_input_norm = true;
     policy.after_qkv_projection = true;
     policy.after_qk_norm = true;

@@ -275,6 +275,10 @@ QKVProjections build_qkv_projections(
                            config.projection_precision,
                        })
                        .build(ctx, input, {*weights.self_attention.qkv_weight, weights.self_attention.qkv_bias});
+        if (config.activation_cast.enabled && config.activation_cast.after_qkv_projection &&
+            config.activation_cast.round_packed_qkv_projection) {
+            qkv = activation_cast(ctx, qkv, config.activation_cast);
+        }
         return {
             SliceModule({2, 0, q_out}).build(ctx, qkv),
             SliceModule({2, q_out, kv_out}).build(ctx, qkv),
@@ -511,7 +515,9 @@ QwenDecoderLayerOutputs QwenDecoderLayerModule::build(
         x_norm = activation_cast(ctx, x_norm, config_.activation_cast);
     }
     auto qkv = build_qkv_projections(ctx, x_norm, weights, config_, dim);
-    if (config_.activation_cast.enabled && config_.activation_cast.after_qkv_projection) {
+    if (config_.activation_cast.enabled && config_.activation_cast.after_qkv_projection &&
+        !(config_.qkv_layout == QwenDecoderQKVLayout::PackedQKV &&
+          config_.activation_cast.round_packed_qkv_projection)) {
         qkv.q = activation_cast(ctx, qkv.q, config_.activation_cast);
         qkv.k = activation_cast(ctx, qkv.k, config_.activation_cast);
         qkv.v = activation_cast(ctx, qkv.v, config_.activation_cast);
@@ -674,7 +680,9 @@ QwenDecoderLayerOutputs QwenDecoderLayerModule::build_with_static_cache_tail(
         x_norm = activation_cast(ctx, x_norm, config_.activation_cast);
     }
     auto qkv = build_qkv_projections(ctx, x_norm, weights, config_, dim);
-    if (config_.activation_cast.enabled && config_.activation_cast.after_qkv_projection) {
+    if (config_.activation_cast.enabled && config_.activation_cast.after_qkv_projection &&
+        !(config_.qkv_layout == QwenDecoderQKVLayout::PackedQKV &&
+          config_.activation_cast.round_packed_qkv_projection)) {
         qkv.q = activation_cast(ctx, qkv.q, config_.activation_cast);
         qkv.k = activation_cast(ctx, qkv.k, config_.activation_cast);
         qkv.v = activation_cast(ctx, qkv.v, config_.activation_cast);
@@ -849,7 +857,9 @@ QwenDecoderLayerOutputs QwenDecoderLayerModule::build_with_static_cache_tail_bat
         x_norm = activation_cast(ctx, x_norm, config_.activation_cast);
     }
     auto qkv = build_qkv_projections(ctx, x_norm, weights, config_, dim);
-    if (config_.activation_cast.enabled && config_.activation_cast.after_qkv_projection) {
+    if (config_.activation_cast.enabled && config_.activation_cast.after_qkv_projection &&
+        !(config_.qkv_layout == QwenDecoderQKVLayout::PackedQKV &&
+          config_.activation_cast.round_packed_qkv_projection)) {
         qkv.q = activation_cast(ctx, qkv.q, config_.activation_cast);
         qkv.k = activation_cast(ctx, qkv.k, config_.activation_cast);
         qkv.v = activation_cast(ctx, qkv.v, config_.activation_cast);

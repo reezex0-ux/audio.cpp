@@ -57,6 +57,9 @@ struct QwenDecoderActivationCastPolicy {
     // cast -> bf16 -> cast -> f32 round trip. Only valid on backends that
     // implement GGML_UNARY_OP_ROUND_BF16 (CUDA/HIP, CPU fallback).
     bool fused_round = false;
+    // Round a contiguous PackedQKV projection before slicing q/k/v so
+    // equivalent per-slice activation rounds share one kernel launch.
+    bool round_packed_qkv_projection = false;
     bool after_input_norm = false;
     bool after_qkv_projection = false;
     bool after_qk_norm = false;
