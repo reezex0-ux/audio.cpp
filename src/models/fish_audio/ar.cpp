@@ -153,7 +153,10 @@ modules::QwenDecoderActivationCastPolicy fish_activation_cast_policy(core::Backe
     policy.after_qkv_projection = true;
     policy.after_qk_norm = true;
     policy.after_rope = true;
-    policy.after_static_cache_update = true;
+    // HIP stores the direct-set-row KV cache as BF16 already, and
+    // FlashGroupedViewKV accepts that cache type directly. Avoid widening the
+    // same BF16 values back to F32 after every cache update.
+    policy.after_static_cache_update = backend_type != core::BackendType::Hip;
     policy.after_attention = true;
     policy.after_attention_output = true;
     policy.after_residual = true;
