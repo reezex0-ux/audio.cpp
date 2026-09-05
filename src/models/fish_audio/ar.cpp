@@ -129,6 +129,9 @@ struct SlowForwardOutput {
     std::vector<float> hidden;
     const float * device_hidden = nullptr;
     std::optional<CompactSemanticLogits> compact_semantic;
+#ifdef ENGINE_HAS_HIP_FISH_FAST_SAMPLER
+    std::optional<detail::HipFastTopKResult> semantic_topk;
+#endif
 };
 
 struct SlowPrefillOutput {
@@ -1046,7 +1049,7 @@ public:
             SlowForwardOutput step_out;
 #ifdef ENGINE_HAS_HIP_FISH_FAST_SAMPLER
             if (phase1i_slow_embed) {
-                step_out = step_graph_->run_frame(frame, profile);
+                step_out = step_graph_->run_frame(frame, options.top_k, profile);
             } else
 #endif
             {
@@ -1367,11 +1370,28 @@ private:
                     throw;
                 }
             }
+            if (runtime_->backend_type() == core::BackendType::Hip &&
+                std::getenv("FISH_PHASE1K_SEMANTIC_TOPK") != nullptr) {
+                const auto & fish_config = runtime_->assets().config;
+                const int32_t begin = static_cast<int32_t>(std::max<int64_t>(0, fish_config.semantic_start_token_id));
+                const int32_t end = static_cast<int32_t>(
+                    std::min<int64_t>(config.vocab_size - 1, fish_config.semantic_end_token_id));
+                const int32_t eos = static_cast<int32_t>(fish_config.im_end_token_id);
+                if (end < begin) {
+                    throw std::runtime_error("Fish Audio semantic sampler token range is invalid");
+                }
+                const bool eos_before = eos >= 0 && eos < begin;
+                const bool eos_after = eos > end && eos < config.vocab_size;
+                const int32_t candidate_count = end - begin + 1 + ((eos_before || eos_after) ? 1 : 0);
+                hip_semantic_sampler_ = detail::hip_fast_sampler_create(candidate_count);
+            }
 #endif
         }
 
         ~StepGraph() {
 #ifdef ENGINE_HAS_HIP_FISH_FAST_SAMPLER
+            detail::hip_fast_sampler_destroy(hip_semantic_sampler_);
+            hip_semantic_sampler_ = nullptr;
             detail::hip_slow_step_destroy(hip_slow_step_);
             hip_slow_step_ = nullptr;
 #endif
@@ -1496,7 +1516,7 @@ private:
         }
 
 #ifdef ENGINE_HAS_HIP_FISH_FAST_SAMPLER
-        SlowForwardOutput run_frame(const std::vector<int32_t> & frame, FishARProfile & profile) {
+        SlowForwardOutput run_frame(const std::vector<int32_t> & frame, int top_k, FishARProfile & profile) {
             const auto & fish_config = runtime_->assets().config;
             const auto & config = fish_config.text;
             if (hip_slow_step_ == nullptr || runtime_->backend_type() != core::BackendType::Hip) {
@@ -1547,16 +1567,34 @@ private:
                 out.hidden.resize(static_cast<size_t>(config.dim));
             }
             timing_start = Clock::now();
+            const int32_t begin = static_cast<int32_t>(std::max<int64_t>(0, fish_config.semantic_start_token_id));
+            const int32_t end = static_cast<int32_t>(
+                std::min<int64_t>(config.vocab_size - 1, fish_config.semantic_end_token_id));
+            const int32_t eos = static_cast<int32_t>(fish_config.im_end_token_id);
+            if (end < begin) {
+                throw std::runtime_error("Fish Audio semantic token range is invalid");
+            }
+            const bool phase1k_semantic_topk =
+                hip_semantic_sampler_ != nullptr &&
+                std::getenv("FISH_PHASE1K_SEMANTIC_TOPK") != nullptr &&
+                top_k > 0 && top_k <= detail::kHipFastSamplerMaxTopK;
             const bool compact_semantic =
+                !phase1k_semantic_topk &&
                 std::getenv("FISH_PHASE1C") != nullptr && runtime_->backend_type() == core::BackendType::Hip;
-            if (compact_semantic) {
-                const int32_t begin = static_cast<int32_t>(std::max<int64_t>(0, fish_config.semantic_start_token_id));
-                const int32_t end = static_cast<int32_t>(
-                    std::min<int64_t>(config.vocab_size - 1, fish_config.semantic_end_token_id));
-                const int32_t eos = static_cast<int32_t>(fish_config.im_end_token_id);
-                if (end < begin) {
-                    throw std::runtime_error("Fish Audio compact semantic token range is invalid");
-                }
+            if (phase1k_semantic_topk) {
+                detail::HipFastTopKResult result;
+                detail::hip_fast_sampler_semantic_topk(
+                    hip_semantic_sampler_,
+                    static_cast<const float *>(logits_->data),
+                    begin,
+                    end,
+                    eos,
+                    static_cast<int32_t>(config.vocab_size),
+                    top_k,
+                    &result,
+                    ggml_backend_cuda_get_stream(runtime_->backend()));
+                out.semantic_topk = result;
+            } else if (compact_semantic) {
                 const int32_t semantic_count = end - begin + 1;
                 const bool eos_before = eos >= 0 && eos < begin;
                 const bool eos_after = eos > end && eos < config.vocab_size;
@@ -1615,6 +1653,7 @@ private:
         ggml_backend_buffer_t state_buffer_ = nullptr;
 #ifdef ENGINE_HAS_HIP_FISH_FAST_SAMPLER
         void * hip_slow_step_ = nullptr;
+        void * hip_semantic_sampler_ = nullptr;
 #endif
     };
 
@@ -2066,43 +2105,50 @@ private:
         const auto & weights = runtime_->weights();
         auto timing_start = Clock::now();
         std::optional<std::vector<float>> biased;
-        if (!slow_forward.compact_semantic.has_value()) {
+        bool prepared_semantic = slow_forward.compact_semantic.has_value();
+#ifdef ENGINE_HAS_HIP_FISH_FAST_SAMPLER
+        prepared_semantic = prepared_semantic || slow_forward.semantic_topk.has_value();
+#endif
+        if (!prepared_semantic) {
             biased = apply_semantic_bias(config, im_end_id(), slow_forward.logits);
         }
         profile.sample_bias_ms += engine::debug::elapsed_ms(timing_start, Clock::now());
+
+        const auto sample_semantic = [&](float temperature, float top_p) -> int32_t {
+#ifdef ENGINE_HAS_HIP_FISH_FAST_SAMPLER
+            if (slow_forward.semantic_topk.has_value()) {
+                return sample_from_hip_topk(
+                    *slow_forward.semantic_topk,
+                    static_cast<size_t>(config.text.vocab_size),
+                    temperature,
+                    top_p,
+                    sample,
+                    sampling_policy_);
+            }
+#endif
+            if (slow_forward.compact_semantic.has_value()) {
+                return sample_from_compact_semantic(
+                    *slow_forward.compact_semantic,
+                    temperature,
+                    top_p,
+                    options.top_k,
+                    sample,
+                    sampling_policy_);
+            }
+            return sample_from_logits(
+                *biased,
+                temperature,
+                top_p,
+                options.top_k,
+                sample,
+                sampling_policy_);
+        };
+
         timing_start = Clock::now();
-        int32_t main_token = slow_forward.compact_semantic.has_value()
-            ? sample_from_compact_semantic(
-                  *slow_forward.compact_semantic,
-                  options.temperature,
-                  options.top_p,
-                  options.top_k,
-                  sample,
-                  sampling_policy_)
-            : sample_from_logits(
-                  *biased,
-                  options.temperature,
-                  options.top_p,
-                  options.top_k,
-                  sample,
-                  sampling_policy_);
+        int32_t main_token = sample_semantic(options.temperature, options.top_p);
         profile.sample_main_ms += engine::debug::elapsed_ms(timing_start, Clock::now());
         timing_start = Clock::now();
-        const int32_t high_token = slow_forward.compact_semantic.has_value()
-            ? sample_from_compact_semantic(
-                  *slow_forward.compact_semantic,
-                  kRasHighTemperature,
-                  kRasHighTopP,
-                  options.top_k,
-                  sample,
-                  sampling_policy_)
-            : sample_from_logits(
-                  *biased,
-                  kRasHighTemperature,
-                  kRasHighTopP,
-                  options.top_k,
-                  sample,
-                  sampling_policy_);
+        const int32_t high_token = sample_semantic(kRasHighTemperature, kRasHighTopP);
         profile.sample_high_ms += engine::debug::elapsed_ms(timing_start, Clock::now());
         if (apply_ras && is_semantic_token(config, main_token) &&
             std::find(sample.previous_main.begin(), sample.previous_main.end(), main_token) != sample.previous_main.end()) {

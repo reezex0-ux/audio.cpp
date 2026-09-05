@@ -23,6 +23,19 @@ void hip_fast_sampler_topk(
     int32_t top_k,
     HipFastTopKResult * host_result);
 
+// Phase 1K: gather the semantic range plus optional EOS on-device, then
+// return only the exact top-k logits/ids needed by the existing CPU sampler.
+void hip_fast_sampler_semantic_topk(
+    void * workspace,
+    const float * device_logits,
+    int32_t semantic_begin,
+    int32_t semantic_end,
+    int32_t eos_index,
+    int32_t source_size,
+    int32_t top_k,
+    HipFastTopKResult * host_result,
+    void * stream);
+
 void hip_fast_sampler_upload_embeddings(
     void * workspace,
     const float * host_embeddings,

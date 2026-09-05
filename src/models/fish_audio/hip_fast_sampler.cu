@@ -36,6 +36,7 @@ size_t slow_embedding_type_size(int32_t type) {
 struct Workspace {
     int32_t vocab_size = 0;
     HipFastTopKResult * packed = nullptr;
+    float * scratch_logits = nullptr;
     uint32_t * chain_rng_words = nullptr;
     int32_t * chain_rng_consumed = nullptr;
     int32_t * chain_codes = nullptr;
@@ -151,6 +152,30 @@ __global__ void exact_topk_kernel(
     if (tid == 0) {
         result->denom = denom_parts[0];
     }
+}
+
+__global__ void gather_semantic_logits_kernel(
+    const float * source,
+    int32_t semantic_begin,
+    int32_t semantic_count,
+    int32_t eos_index,
+    bool eos_before,
+    bool eos_after,
+    int32_t candidate_count,
+    float * compact) {
+    const int32_t local = static_cast<int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (local >= candidate_count) {
+        return;
+    }
+    int32_t source_index = 0;
+    if (eos_before) {
+        source_index = local == 0 ? eos_index : semantic_begin + local - 1;
+    } else if (eos_after) {
+        source_index = local < semantic_count ? semantic_begin + local : eos_index;
+    } else {
+        source_index = semantic_begin + local;
+    }
+    compact[local] = source[source_index];
 }
 
 __global__ void prepare_fast_step_kernel(
@@ -495,6 +520,9 @@ void free_workspace(Workspace * ws) {
     if (ws->packed != nullptr) {
         (void) hipFree(ws->packed);
     }
+    if (ws->scratch_logits != nullptr) {
+        (void) hipFree(ws->scratch_logits);
+    }
     if (ws->embeddings != nullptr) {
         (void) hipFree(ws->embeddings);
     }
@@ -533,6 +561,9 @@ void * hip_fast_sampler_create(int32_t vocab_size) {
     ws->vocab_size = vocab_size;
     try {
         check_hip(hipMalloc(&ws->packed, sizeof(HipFastTopKResult)), "hipMalloc Fish sampler result");
+        check_hip(
+            hipMalloc(&ws->scratch_logits, static_cast<size_t>(vocab_size) * sizeof(float)),
+            "hipMalloc Fish sampler scratch logits");
         check_hip(hipMalloc(&ws->chain_rng_words, 32 * sizeof(uint32_t)), "hipMalloc Fish chain rng");
         check_hip(hipMalloc(&ws->chain_rng_consumed, sizeof(int32_t)), "hipMalloc Fish chain consumed");
         check_hip(hipMalloc(&ws->chain_codes, 16 * sizeof(int32_t)), "hipMalloc Fish chain codes");
@@ -578,6 +609,78 @@ void hip_fast_sampler_topk(
     check_hip(
         hipMemcpy(host_result, ws->packed, sizeof(HipFastTopKResult), hipMemcpyDeviceToHost),
         "hipMemcpy Fish sampler result");
+}
+
+void hip_fast_sampler_semantic_topk(
+    void * workspace,
+    const float * device_logits,
+    int32_t semantic_begin,
+    int32_t semantic_end,
+    int32_t eos_index,
+    int32_t source_size,
+    int32_t top_k,
+    HipFastTopKResult * host_result,
+    void * stream_ptr) {
+    auto * ws = static_cast<Workspace *>(workspace);
+    auto stream = static_cast<hipStream_t>(stream_ptr);
+    if (ws == nullptr || device_logits == nullptr || host_result == nullptr ||
+        ws->scratch_logits == nullptr || semantic_begin < 0 || semantic_end < semantic_begin ||
+        semantic_end >= source_size || source_size <= 0) {
+        throw std::invalid_argument("HIP Fish semantic sampler received invalid arguments");
+    }
+    const int32_t semantic_count = semantic_end - semantic_begin + 1;
+    const bool eos_before = eos_index >= 0 && eos_index < semantic_begin;
+    const bool eos_after = eos_index > semantic_end && eos_index < source_size;
+    const int32_t candidate_count = semantic_count + ((eos_before || eos_after) ? 1 : 0);
+    if (candidate_count != ws->vocab_size || top_k <= 0 || top_k > candidate_count ||
+        top_k > kHipFastSamplerMaxTopK) {
+        throw std::invalid_argument("HIP Fish semantic sampler candidate count/top_k mismatch");
+    }
+
+    constexpr int threads = 256;
+    const int gather_blocks = (candidate_count + threads - 1) / threads;
+    hipLaunchKernelGGL(
+        gather_semantic_logits_kernel,
+        dim3(gather_blocks), dim3(threads), 0, stream,
+        device_logits,
+        semantic_begin,
+        semantic_count,
+        eos_index,
+        eos_before,
+        eos_after,
+        candidate_count,
+        ws->scratch_logits);
+    check_hip(hipGetLastError(), "gather_semantic_logits_kernel Fish sampler");
+
+    const size_t shared_bytes =
+        static_cast<size_t>(candidate_count) * sizeof(float) +
+        static_cast<size_t>(threads) * (sizeof(float) + sizeof(int32_t) + sizeof(double));
+    hipLaunchKernelGGL(
+        exact_topk_kernel,
+        dim3(1),
+        dim3(threads),
+        shared_bytes,
+        stream,
+        ws->scratch_logits,
+        candidate_count,
+        top_k,
+        ws->packed);
+    check_hip(hipGetLastError(), "exact_topk_kernel Fish semantic sampler");
+    check_hip(
+        hipMemcpyAsync(host_result, ws->packed, sizeof(HipFastTopKResult), hipMemcpyDeviceToHost, stream),
+        "hipMemcpyAsync Fish semantic sampler result");
+    check_hip(hipStreamSynchronize(stream), "hipStreamSynchronize Fish semantic sampler");
+
+    for (int32_t i = 0; i < host_result->count; ++i) {
+        const int32_t local = host_result->indices[i];
+        if (eos_before) {
+            host_result->indices[i] = local == 0 ? eos_index : semantic_begin + local - 1;
+        } else if (eos_after) {
+            host_result->indices[i] = local < semantic_count ? semantic_begin + local : eos_index;
+        } else {
+            host_result->indices[i] = semantic_begin + local;
+        }
+    }
 }
 
 void hip_fast_sampler_upload_embeddings(
