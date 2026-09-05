@@ -20,6 +20,9 @@ void check_hip(hipError_t status, const char * label) {
 struct Workspace {
     int32_t vocab_size = 0;
     HipFastTopKResult * packed = nullptr;
+    uint32_t * chain_rng_words = nullptr;
+    int32_t * chain_rng_consumed = nullptr;
+    int32_t * chain_codes = nullptr;
     float * embeddings = nullptr;
     int32_t embedding_rows = 0;
     int32_t embedding_dim = 0;
@@ -144,6 +147,184 @@ __global__ void gather_embedding_kernel(
     }
 }
 
+__global__ void chain_prepare_kernel(
+    const float * embedding_table,
+    int32_t embedding_dim,
+    int32_t code,
+    int32_t position,
+    int32_t mask_length,
+    int32_t * device_position,
+    uint16_t * device_mask,
+    float * device_input) {
+    const int tid = static_cast<int>(threadIdx.x);
+    if (tid == 0) {
+        *device_position = position;
+        if (position == 0) {
+            for (int i = 0; i < mask_length; ++i) device_mask[i] = 0xfc00u;
+        }
+        if (position >= 0 && position < mask_length) device_mask[position] = 0u;
+    }
+    for (int i = tid; i < embedding_dim; i += static_cast<int>(blockDim.x)) {
+        device_input[i] = embedding_table[static_cast<size_t>(code) * embedding_dim + i];
+    }
+}
+
+__global__ void exact_topk_select_prepare_kernel(
+    const float * logits,
+    int32_t count,
+    int32_t top_k,
+    float temperature,
+    float top_p,
+    const uint32_t * rng_words,
+    int32_t * rng_consumed,
+    int32_t * selected_codes,
+    int32_t output_slot,
+    const float * embedding_table,
+    int32_t embedding_dim,
+    int32_t next_position,
+    int32_t mask_length,
+    int32_t * device_position,
+    uint16_t * device_mask,
+    float * device_input,
+    HipFastTopKResult * result) {
+    constexpr int kLocalItems = 16;
+    extern __shared__ unsigned char smem_raw[];
+    float * best_values = reinterpret_cast<float *>(smem_raw);
+    int32_t * best_indices = reinterpret_cast<int32_t *>(best_values + blockDim.x);
+    double * denom_parts = reinterpret_cast<double *>(best_indices + blockDim.x);
+    float * sample_weights = reinterpret_cast<float *>(denom_parts + blockDim.x);
+
+    const int tid = static_cast<int>(threadIdx.x);
+    float local_values[kLocalItems];
+    int32_t local_indices[kLocalItems];
+    #pragma unroll
+    for (int j = 0; j < kLocalItems; ++j) {
+        local_values[j] = -INFINITY;
+        local_indices[j] = INT32_MAX;
+    }
+
+    int local_count = 0;
+    for (int i = tid; i < count; i += static_cast<int>(blockDim.x)) {
+        const float raw = logits[i];
+        const float v = isfinite(raw) ? raw : -INFINITY;
+        int pos = local_count;
+        if (pos >= kLocalItems) pos = kLocalItems - 1;
+        if (local_count < kLocalItems) ++local_count;
+        while (pos > 0 && better(v, i, local_values[pos - 1], local_indices[pos - 1])) {
+            if (pos < kLocalItems) {
+                local_values[pos] = local_values[pos - 1];
+                local_indices[pos] = local_indices[pos - 1];
+            }
+            --pos;
+        }
+        if (pos < kLocalItems) {
+            local_values[pos] = v;
+            local_indices[pos] = i;
+        }
+    }
+
+    int local_head = 0;
+    float max_logit = -INFINITY;
+    for (int rank = 0; rank < top_k; ++rank) {
+        const bool have_local = local_head < local_count;
+        best_values[tid] = have_local ? local_values[local_head] : -INFINITY;
+        best_indices[tid] = have_local ? local_indices[local_head] : INT32_MAX;
+        __syncthreads();
+        for (int stride = static_cast<int>(blockDim.x) / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                const float ov = best_values[tid + stride];
+                const int oi = best_indices[tid + stride];
+                if (better(ov, oi, best_values[tid], best_indices[tid])) {
+                    best_values[tid] = ov;
+                    best_indices[tid] = oi;
+                }
+            }
+            __syncthreads();
+        }
+        const float selected_value = best_values[0];
+        const int selected_index = best_indices[0];
+        if (tid == 0) {
+            if (rank == 0) {
+                max_logit = selected_value;
+                result->max_logit = selected_value;
+                result->count = top_k;
+            }
+            result->logits[rank] = selected_value;
+            result->indices[rank] = selected_index;
+        }
+        __syncthreads();
+        if (rank == 0) max_logit = result->max_logit;
+        if (have_local && local_indices[local_head] == selected_index) ++local_head;
+        __syncthreads();
+    }
+
+    double local_denom = 0.0;
+    for (int i = tid; i < count; i += static_cast<int>(blockDim.x)) {
+        const float v = logits[i];
+        if (isfinite(v)) local_denom += static_cast<double>(expf(v - max_logit));
+    }
+    denom_parts[tid] = local_denom;
+    __syncthreads();
+    for (int stride = static_cast<int>(blockDim.x) / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) denom_parts[tid] += denom_parts[tid + stride];
+        __syncthreads();
+    }
+    if (tid == 0) result->denom = denom_parts[0];
+    __syncthreads();
+
+    if (tid == 0) {
+        double cumulative = 0.0;
+        int kept = 0;
+        for (int i = 0; i < top_k; ++i) {
+            const float prob = static_cast<float>(static_cast<double>(expf(result->logits[i] - result->max_logit)) / result->denom);
+            cumulative += static_cast<double>(prob);
+            if (cumulative > static_cast<double>(top_p) && i != 0) break;
+            ++kept;
+        }
+        int chosen = 0;
+        if (kept >= 2) {
+            const float tscale = temperature > 1.0e-5f ? temperature : 1.0e-5f;
+            float fmax = -INFINITY;
+            for (int i = 0; i < kept; ++i) fmax = fmax > result->logits[i] / tscale ? fmax : result->logits[i] / tscale;
+            double fden = 0.0;
+            for (int i = 0; i < kept; ++i) {
+                const float q = expf(result->logits[i] / tscale - fmax);
+                sample_weights[i] = q;
+                fden += static_cast<double>(q);
+            }
+            double wsum = 0.0;
+            for (int i = 0; i < kept; ++i) {
+                const float probability = static_cast<float>(static_cast<double>(sample_weights[i]) / fden);
+                sample_weights[i] = probability > 0.0f ? probability : 0.0f;
+                wsum += static_cast<double>(sample_weights[i]);
+            }
+            const int off = *rng_consumed;
+            const double r = 4294967296.0;
+            double psum = static_cast<double>(rng_words[off]);
+            psum += static_cast<double>(rng_words[off + 1]) * r;
+            const double p = psum / (r * r);
+            *rng_consumed = off + 2;
+            double cp = 0.0;
+            chosen = kept - 1;
+            for (int i = 0; i < kept; ++i) {
+                cp += static_cast<double>(sample_weights[i]) / wsum;
+                if (i == kept - 1) cp = 1.0;
+                if (cp >= p) { chosen = i; break; }
+            }
+        }
+        const int code = result->indices[chosen];
+        selected_codes[output_slot] = code;
+        *device_position = next_position;
+        if (next_position >= 0 && next_position < mask_length) device_mask[next_position] = 0u;
+        best_indices[0] = code;
+    }
+    __syncthreads();
+    const int selected = best_indices[0];
+    for (int i = tid; i < embedding_dim; i += static_cast<int>(blockDim.x)) {
+        device_input[i] = embedding_table[static_cast<size_t>(selected) * embedding_dim + i];
+    }
+}
+
 void free_workspace(Workspace * ws) {
     if (ws == nullptr) {
         return;
@@ -153,6 +334,15 @@ void free_workspace(Workspace * ws) {
     }
     if (ws->embeddings != nullptr) {
         (void) hipFree(ws->embeddings);
+    }
+    if (ws->chain_rng_words != nullptr) {
+        (void) hipFree(ws->chain_rng_words);
+    }
+    if (ws->chain_rng_consumed != nullptr) {
+        (void) hipFree(ws->chain_rng_consumed);
+    }
+    if (ws->chain_codes != nullptr) {
+        (void) hipFree(ws->chain_codes);
     }
     delete ws;
 }
@@ -167,6 +357,9 @@ void * hip_fast_sampler_create(int32_t vocab_size) {
     ws->vocab_size = vocab_size;
     try {
         check_hip(hipMalloc(&ws->packed, sizeof(HipFastTopKResult)), "hipMalloc Fish sampler result");
+        check_hip(hipMalloc(&ws->chain_rng_words, 32 * sizeof(uint32_t)), "hipMalloc Fish chain rng");
+        check_hip(hipMalloc(&ws->chain_rng_consumed, sizeof(int32_t)), "hipMalloc Fish chain consumed");
+        check_hip(hipMalloc(&ws->chain_codes, 16 * sizeof(int32_t)), "hipMalloc Fish chain codes");
     } catch (...) {
         free_workspace(ws);
         throw;
@@ -270,6 +463,73 @@ void hip_fast_sampler_prepare_step(
         dim3(1), dim3(threads), 0, stream,
         position, mask_length, device_position, static_cast<uint16_t *>(device_mask));
     check_hip(hipGetLastError(), "prepare_fast_step_kernel Fish sampler");
+}
+
+void hip_fast_sampler_chain_begin(
+    void * workspace,
+    const uint32_t * host_rng_words,
+    int32_t rng_word_count,
+    int32_t initial_code,
+    int32_t position,
+    int32_t mask_length,
+    int32_t * device_position,
+    void * device_mask,
+    float * device_input,
+    void * stream_ptr) {
+    auto * ws = static_cast<Workspace *>(workspace);
+    auto stream = static_cast<hipStream_t>(stream_ptr);
+    if (!ws || !host_rng_words || rng_word_count <= 0 || rng_word_count > 32 || !ws->embeddings) throw std::invalid_argument("invalid Fish chain begin");
+    check_hip(hipMemcpyAsync(ws->chain_rng_words, host_rng_words, static_cast<size_t>(rng_word_count)*sizeof(uint32_t), hipMemcpyHostToDevice, stream), "Fish chain rng upload");
+    check_hip(hipMemsetAsync(ws->chain_rng_consumed, 0, sizeof(int32_t), stream), "Fish chain consumed reset");
+    hipLaunchKernelGGL(chain_prepare_kernel, dim3(1), dim3(256), 0, stream,
+        ws->embeddings, ws->embedding_dim, initial_code, position, mask_length,
+        device_position, static_cast<uint16_t *>(device_mask), device_input);
+    check_hip(hipGetLastError(), "Fish chain prepare kernel");
+}
+
+void hip_fast_sampler_chain_select_prepare(
+    void * workspace,
+    const float * device_logits,
+    int32_t top_k,
+    float temperature,
+    float top_p,
+    int32_t output_slot,
+    int32_t next_position,
+    int32_t mask_length,
+    int32_t * device_position,
+    void * device_mask,
+    float * device_input,
+    void * stream_ptr) {
+    auto * ws = static_cast<Workspace *>(workspace);
+    auto stream = static_cast<hipStream_t>(stream_ptr);
+    if (!ws || !device_logits || !ws->embeddings || output_slot < 0 || output_slot >= 16) throw std::invalid_argument("invalid Fish chain step");
+    constexpr int threads = 256;
+    if (ws->vocab_size > threads * 16 || top_k <= 0 || top_k > kHipFastSamplerMaxTopK) {
+        throw std::invalid_argument("Fish chain local top-k shape is unsupported");
+    }
+    const size_t shared_bytes =
+        static_cast<size_t>(threads) * (sizeof(float) + sizeof(int32_t) + sizeof(double)) +
+        static_cast<size_t>(kHipFastSamplerMaxTopK) * sizeof(float);
+    hipLaunchKernelGGL(exact_topk_select_prepare_kernel, dim3(1), dim3(threads), shared_bytes, stream,
+        device_logits, ws->vocab_size, top_k, temperature, top_p,
+        ws->chain_rng_words, ws->chain_rng_consumed, ws->chain_codes, output_slot,
+        ws->embeddings, ws->embedding_dim, next_position, mask_length,
+        device_position, static_cast<uint16_t *>(device_mask), device_input, ws->packed);
+    check_hip(hipGetLastError(), "Fish chain select kernel");
+}
+
+void hip_fast_sampler_chain_finish(
+    void * workspace,
+    int32_t count,
+    int32_t * host_codes,
+    int32_t * host_rng_words_consumed,
+    void * stream_ptr) {
+    auto * ws = static_cast<Workspace *>(workspace);
+    auto stream = static_cast<hipStream_t>(stream_ptr);
+    if (!ws || !host_codes || !host_rng_words_consumed || count <= 0 || count > 16) throw std::invalid_argument("invalid Fish chain finish");
+    check_hip(hipMemcpyAsync(host_codes, ws->chain_codes, static_cast<size_t>(count)*sizeof(int32_t), hipMemcpyDeviceToHost, stream), "Fish chain codes read");
+    check_hip(hipMemcpyAsync(host_rng_words_consumed, ws->chain_rng_consumed, sizeof(int32_t), hipMemcpyDeviceToHost, stream), "Fish chain consumed read");
+    check_hip(hipStreamSynchronize(stream), "Fish chain stream sync");
 }
 
 }  // namespace engine::models::fish_audio::detail

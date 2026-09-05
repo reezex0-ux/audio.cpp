@@ -42,4 +42,38 @@ void hip_fast_sampler_prepare_step(
     void * device_mask,
     void * stream);
 
+
+void hip_fast_sampler_chain_begin(
+    void * workspace,
+    const uint32_t * host_rng_words,
+    int32_t rng_word_count,
+    int32_t initial_code,
+    int32_t position,
+    int32_t mask_length,
+    int32_t * device_position,
+    void * device_mask,
+    float * device_input,
+    void * stream);
+
+void hip_fast_sampler_chain_select_prepare(
+    void * workspace,
+    const float * device_logits,
+    int32_t top_k,
+    float temperature,
+    float top_p,
+    int32_t output_slot,
+    int32_t next_position,
+    int32_t mask_length,
+    int32_t * device_position,
+    void * device_mask,
+    float * device_input,
+    void * stream);
+
+void hip_fast_sampler_chain_finish(
+    void * workspace,
+    int32_t count,
+    int32_t * host_codes,
+    int32_t * host_rng_words_consumed,
+    void * stream);
+
 }  // namespace engine::models::fish_audio::detail

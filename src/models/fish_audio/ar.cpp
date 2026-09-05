@@ -23,6 +23,7 @@
 #include <ggml.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -1656,6 +1657,41 @@ private:
         }
 
 #ifdef ENGINE_HAS_HIP_FISH_FAST_SAMPLER
+        std::pair<std::array<int32_t, 9>, int32_t> run_codebook_chain(
+            int32_t initial_code,
+            int top_k,
+            float temperature,
+            float top_p,
+            const std::array<uint32_t, 18> & rng_words,
+            FishARProfile & profile) {
+            const auto & config = runtime_->assets().config.fast;
+            if (hip_sampler_ == nullptr || config.num_codebooks != 10 ||
+                top_k <= 0 || top_k > detail::kHipFastSamplerMaxTopK) {
+                throw std::runtime_error("HIP Fish chained Fast-AR requires 10 codebooks");
+            }
+            void * stream = ggml_backend_cuda_get_stream(runtime_->backend());
+            if (stream == nullptr) throw std::runtime_error("HIP Fish chained Fast-AR stream unavailable");
+            std::array<int32_t, 9> codes{};
+            int32_t consumed = 0;
+            auto total_start = Clock::now();
+            detail::hip_fast_sampler_chain_begin(
+                hip_sampler_, rng_words.data(), static_cast<int32_t>(rng_words.size()), initial_code, 1,
+                static_cast<int32_t>(config.num_codebooks), static_cast<int32_t *>(position_->data), mask_->data,
+                static_cast<float *>(input_->data), stream);
+            for (int32_t slot = 0; slot < 9; ++slot) {
+                ++profile.fast_runs;
+                const ggml_status status = core::compute_backend_graph(runtime_->backend(), graph_, nullptr, "fish_audio.ar.fast.chain");
+                if (status != GGML_STATUS_SUCCESS) throw std::runtime_error("Fish Audio chained Fast-AR graph compute failed");
+                detail::hip_fast_sampler_chain_select_prepare(
+                    hip_sampler_, static_cast<const float *>(logits_->data), top_k, temperature, top_p,
+                    slot, slot + 2, static_cast<int32_t>(config.num_codebooks),
+                    static_cast<int32_t *>(position_->data), mask_->data, static_cast<float *>(input_->data), stream);
+            }
+            detail::hip_fast_sampler_chain_finish(hip_sampler_, 9, codes.data(), &consumed, stream);
+            profile.fast_graph_ms += engine::debug::elapsed_ms(total_start, Clock::now());
+            return {codes, consumed};
+        }
+
         detail::HipFastTopKResult run_topk_code(
             int32_t code,
             int64_t position,
@@ -1882,6 +1918,35 @@ private:
             0,
             static_cast<int32_t>(config.fast.vocab_size - 1));
         frame[1] = code;
+#ifdef ENGINE_HAS_HIP_FISH_FAST_SAMPLER
+        // HIP uses the libstdc++ std::discrete_distribution path, whose
+        // mt19937 generate_canonical<double> consumes two 32-bit words per
+        // non-degenerate draw. Chain the nine acoustic-codebook steps on the
+        // backend stream only for that RNG path; CUDA's policy stays separate.
+        if (phase1b_fast_path && std::getenv("FISH_CHAIN9") != nullptr &&
+            !sampling_policy_.cuda_fast_path && runtime_->backend_type() == core::BackendType::Hip &&
+            config.fast.num_codebooks == 10 && options.top_k > 0 &&
+            options.top_k <= detail::kHipFastSamplerMaxTopK) {
+            std::array<uint32_t, 18> raw_words{};
+            auto rng_copy = sample.rng;
+            for (auto & word : raw_words) {
+                word = rng_copy();
+            }
+            const auto chained = fast_graph_->run_codebook_chain(
+                code, options.top_k, options.temperature, options.top_p, raw_words, profile);
+            if (chained.second < 0 || chained.second > static_cast<int32_t>(raw_words.size())) {
+                throw std::runtime_error("Fish Audio chained Fast-AR RNG consumption invalid");
+            }
+            for (int32_t i = 0; i < chained.second; ++i) {
+                (void) sample.rng();
+            }
+            sample.call_index += 9;
+            for (size_t i = 0; i < chained.first.size(); ++i) {
+                frame[i + 2] = chained.first[i];
+            }
+            return frame;
+        }
+#endif
         for (int64_t codebook = 1; codebook < config.fast.num_codebooks; ++codebook) {
 #ifdef ENGINE_HAS_HIP_FISH_FAST_SAMPLER
             if (runtime_->backend_type() == core::BackendType::Hip &&
