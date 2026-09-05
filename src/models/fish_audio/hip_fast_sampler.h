@@ -76,6 +76,18 @@ void hip_fast_sampler_prepare_step(
     void * device_mask,
     void * stream);
 
+// Phase 1J: prime Fast-AR directly from a Slow-AR hidden vector already on
+// the same HIP device, while preparing position/mask in the same kernel.
+void hip_fast_sampler_prime_device(
+    void * workspace,
+    const float * device_source,
+    int32_t dim,
+    int32_t mask_length,
+    int32_t * device_position,
+    void * device_mask,
+    float * device_input,
+    void * stream);
+
 
 void hip_fast_sampler_chain_begin(
     void * workspace,

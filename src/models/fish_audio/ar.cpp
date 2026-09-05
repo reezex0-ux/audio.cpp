@@ -127,6 +127,7 @@ struct CompactSemanticLogits {
 struct SlowForwardOutput {
     std::vector<float> logits;
     std::vector<float> hidden;
+    const float * device_hidden = nullptr;
     std::optional<CompactSemanticLogits> compact_semantic;
 };
 
@@ -1540,7 +1541,11 @@ private:
             }
             cache_.advance_after_direct_append(1);
             SlowForwardOutput out;
-            out.hidden.resize(static_cast<size_t>(config.dim));
+            const bool phase1j_device_hidden =
+                std::getenv("FISH_PHASE1J_DEVICE_HIDDEN") != nullptr && runtime_->backend_type() == core::BackendType::Hip;
+            if (!phase1j_device_hidden) {
+                out.hidden.resize(static_cast<size_t>(config.dim));
+            }
             timing_start = Clock::now();
             const bool compact_semantic =
                 std::getenv("FISH_PHASE1C") != nullptr && runtime_->backend_type() == core::BackendType::Hip;
@@ -1582,7 +1587,11 @@ private:
                 out.logits.resize(static_cast<size_t>(config.vocab_size));
                 ggml_backend_tensor_get(logits_, out.logits.data(), 0, out.logits.size() * sizeof(float));
             }
-            ggml_backend_tensor_get(hidden_, out.hidden.data(), 0, out.hidden.size() * sizeof(float));
+            if (phase1j_device_hidden) {
+                out.device_hidden = static_cast<const float *>(hidden_->data);
+            } else {
+                ggml_backend_tensor_get(hidden_, out.hidden.data(), 0, out.hidden.size() * sizeof(float));
+            }
             profile.step_output_read_ms += engine::debug::elapsed_ms(timing_start, Clock::now());
             return out;
         }
@@ -1789,6 +1798,35 @@ private:
                 throw std::runtime_error("Fish Audio fast AR graph compute failed");
             }
         }
+
+#ifdef ENGINE_HAS_HIP_FISH_FAST_SAMPLER
+        void prime_device(const float * device_input, FishARProfile & profile) {
+            const auto & config = runtime_->assets().config.fast;
+            if (hip_sampler_ == nullptr || device_input == nullptr || runtime_->backend_type() != core::BackendType::Hip) {
+                throw std::runtime_error("Fish Audio fast AR device prime is unavailable");
+            }
+            ++profile.fast_runs;
+            auto timing_start = Clock::now();
+            detail::hip_fast_sampler_prime_device(
+                hip_sampler_,
+                device_input,
+                static_cast<int32_t>(config.dim),
+                static_cast<int32_t>(config.num_codebooks),
+                static_cast<int32_t *>(position_->data),
+                mask_->data,
+                static_cast<float *>(input_->data),
+                ggml_backend_cuda_get_stream(runtime_->backend()));
+            profile.fast_input_upload_ms += engine::debug::elapsed_ms(timing_start, Clock::now());
+            core::set_backend_threads(runtime_->backend(), runtime_->threads());
+            timing_start = Clock::now();
+            const ggml_status status = core::compute_backend_graph(runtime_->backend(), graph_, nullptr, "fish_audio.ar.fast");
+            ggml_backend_synchronize(runtime_->backend());
+            profile.fast_graph_ms += engine::debug::elapsed_ms(timing_start, Clock::now());
+            if (status != GGML_STATUS_SUCCESS) {
+                throw std::runtime_error("Fish Audio fast AR graph compute failed");
+            }
+        }
+#endif
 
         std::vector<float> run(const std::vector<float> & input, int64_t position, FishARProfile & profile) {
             const auto & config = runtime_->assets().config.fast;
@@ -2082,7 +2120,11 @@ private:
         const bool phase1b_fast_path =
             std::getenv("FISH_PHASE1B") != nullptr && runtime_->backend_type() == core::BackendType::Hip;
         if (phase1b_fast_path) {
-            fast_graph_->prime(slow_forward.hidden, profile);
+            if (std::getenv("FISH_PHASE1J_DEVICE_HIDDEN") != nullptr && slow_forward.device_hidden != nullptr) {
+                fast_graph_->prime_device(slow_forward.device_hidden, profile);
+            } else {
+                fast_graph_->prime(slow_forward.hidden, profile);
+            }
         } else
 #endif
         {

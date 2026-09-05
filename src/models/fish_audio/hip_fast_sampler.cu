@@ -171,6 +171,29 @@ __global__ void prepare_fast_step_kernel(
     }
 }
 
+__global__ void prime_fast_from_device_kernel(
+    const float * source,
+    int32_t dim,
+    int32_t mask_length,
+    int32_t * device_position,
+    uint16_t * device_mask,
+    float * device_input) {
+    const int32_t i = static_cast<int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (blockIdx.x == 0) {
+        const int32_t tid = static_cast<int32_t>(threadIdx.x);
+        if (tid == 0) {
+            device_position[0] = 0;
+        }
+        for (int32_t mask_index = tid; mask_index < mask_length; mask_index += static_cast<int32_t>(blockDim.x)) {
+            device_mask[mask_index] =
+                (mask_index == 0) ? static_cast<uint16_t>(0x0000) : static_cast<uint16_t>(0xfc00);
+        }
+    }
+    if (i < dim) {
+        device_input[i] = source[i];
+    }
+}
+
 __global__ void gather_embedding_kernel(
     const float * table,
     int32_t dim,
@@ -761,6 +784,31 @@ void hip_fast_sampler_prepare_step(
         dim3(1), dim3(threads), 0, stream,
         position, mask_length, device_position, static_cast<uint16_t *>(device_mask));
     check_hip(hipGetLastError(), "prepare_fast_step_kernel Fish sampler");
+}
+
+void hip_fast_sampler_prime_device(
+    void * workspace,
+    const float * device_source,
+    int32_t dim,
+    int32_t mask_length,
+    int32_t * device_position,
+    void * device_mask,
+    float * device_input,
+    void * stream_ptr) {
+    auto * ws = static_cast<Workspace *>(workspace);
+    auto stream = static_cast<hipStream_t>(stream_ptr);
+    if (ws == nullptr || device_source == nullptr || device_position == nullptr ||
+        device_mask == nullptr || device_input == nullptr || dim <= 0 || mask_length <= 0) {
+        throw std::invalid_argument("HIP Fish fast device prime received invalid arguments");
+    }
+    constexpr int threads = 256;
+    const int blocks = (dim + threads - 1) / threads;
+    hipLaunchKernelGGL(
+        prime_fast_from_device_kernel,
+        dim3(blocks), dim3(threads), 0, stream,
+        device_source, dim, mask_length, device_position,
+        static_cast<uint16_t *>(device_mask), device_input);
+    check_hip(hipGetLastError(), "prime_fast_from_device_kernel Fish sampler");
 }
 
 void hip_fast_sampler_chain_begin(
