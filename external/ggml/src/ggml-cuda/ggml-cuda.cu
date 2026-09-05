@@ -4057,10 +4057,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     ggml_tensor * node = cgraph->nodes[i];
 
     // Fish S2 Phase 1Q: recurrent residual ROUND_BF16 -> ADD fusion.
-    // Only the first-layer allocator pattern is safe here: ADD dst aliases the
-    // ROUND output, while ADD src0 is disjoint. Explicit pre-round RHS requires
-    // bin_bcast n_fuse=0; n_fuse=1 silently rereads dst->src[1].
-    if (getenv("FISH_PHASE1Q_SAFE_RESIDUAL_ADD_ROUND_FUSION") != nullptr && i > 0 && i + 1 < cgraph->n_nodes) {
+    // The narrow gate only accepts ADD dst == ROUND output. The full gate also
+    // accepts ADD dst == ADD src0, which is safe for this same-shape elementwise
+    // kernel when the pre-round RHS is disjoint. Explicit RHS requires n_fuse=0.
+    const bool fish_phase1q_safe = getenv("FISH_PHASE1Q_SAFE_RESIDUAL_ADD_ROUND_FUSION") != nullptr;
+    const bool fish_phase1q_full = getenv("FISH_PHASE1Q_ALL_RESIDUAL_ADD_ROUND_FUSION") != nullptr;
+    if ((fish_phase1q_safe || fish_phase1q_full) && i > 0 && i + 1 < cgraph->n_nodes) {
         ggml_tensor * reshape_node = cgraph->nodes[i - 1];
         ggml_tensor * round_node   = cgraph->nodes[i];
         ggml_tensor * add_node     = cgraph->nodes[i + 1];
@@ -4079,10 +4081,28 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             ggml_node_get_use_count(cgraph, i - 1) == 1 &&
             ggml_node_get_use_count(cgraph, i) == 1 &&
             !(reshape_node->flags & GGML_TENSOR_FLAG_OUTPUT) &&
-            !(round_node->flags & GGML_TENSOR_FLAG_OUTPUT) &&
-            add_node->data == round_node->data && add_node->buffer == round_node->buffer) {
-            const int out_nodes[] = { i + 1 };
-            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, out_nodes, 1)) {
+            !(round_node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+
+            const bool dst_is_round = add_node->data == round_node->data && add_node->buffer == round_node->buffer;
+            const bool dst_is_src0  = add_node->data == add_node->src[0]->data && add_node->buffer == add_node->src[0]->buffer;
+            bool memory_ok = false;
+
+            if (dst_is_round) {
+                const int out_nodes[] = { i + 1 };
+                memory_ok = ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, out_nodes, 1);
+            } else if (fish_phase1q_full && dst_is_src0) {
+                const auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+                    const uintptr_t a0 = (uintptr_t) a->data;
+                    const uintptr_t b0 = (uintptr_t) b->data;
+                    const uintptr_t a1 = a0 + ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
+                    const uintptr_t b1 = b0 + ggml_backend_buft_get_alloc_size(b->buffer->buft, b);
+                    return a0 < b1 && b0 < a1;
+                };
+                // In-place src0 is intentional; no other fused input may alias it.
+                memory_ok = !overlaps(add_node, reshape_node) && !overlaps(add_node, round_node);
+            }
+
+            if (memory_ok) {
                 ggml_cuda_op_add_round_bf16_rhs(*cuda_ctx, add_node->src[0], reshape_node, add_node);
                 return 1;
             }
