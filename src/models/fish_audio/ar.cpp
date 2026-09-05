@@ -868,6 +868,7 @@ FishStaticDecoderOutputs build_fish_static_decoder(
                             .build(ctx, hidden, weights.lm_head);
     auto fast_hidden = norm_fastlayer_input ? hidden : x;
     runtime::TransformerKVCacheOptions cache_options;
+    cache_options.allow_f16_storage = !cache_keys.empty() && cache_keys.front().type == GGML_TYPE_F16;
     cache_options.allow_bf16_storage = !cache_keys.empty() && cache_keys.front().type == GGML_TYPE_BF16;
     return {
         fast_hidden,
@@ -1233,8 +1234,15 @@ private:
             std::vector<core::TensorValue> cache_values;
             cache_keys.reserve(runtime_->weights().slow_layers.size());
             cache_values.reserve(runtime_->weights().slow_layers.size());
+            // Fish rounds K/V to BF16 values before the cache write. HIP tile FlashAttention
+            // consumes them as FP16, so storing those already-rounded values as F16 avoids a
+            // BF16->F16 conversion on every cache update without changing attention inputs.
+            const bool hip_f16_attention_cache =
+                runtime_->backend_type() == core::BackendType::Hip &&
+                std::getenv("FISH_HIP_F16_ATTN_CACHE") != nullptr;
             const ggml_type cache_type =
-                runtime_->backend_type() == core::BackendType::Vulkan ? GGML_TYPE_F32 : GGML_TYPE_BF16;
+                runtime_->backend_type() == core::BackendType::Vulkan ? GGML_TYPE_F32 :
+                hip_f16_attention_cache ? GGML_TYPE_F16 : GGML_TYPE_BF16;
             for (size_t layer = 0; layer < runtime_->weights().slow_layers.size(); ++layer) {
                 cache_keys.push_back(core::wrap_tensor(
                     ggml_new_tensor_4d(
@@ -1464,8 +1472,15 @@ private:
             std::vector<core::TensorValue> cache_values;
             cache_keys.reserve(weights.fast_layers.size());
             cache_values.reserve(weights.fast_layers.size());
+            // Fish rounds K/V to BF16 values before the cache write. HIP tile FlashAttention
+            // consumes them as FP16, so storing those already-rounded values as F16 avoids a
+            // BF16->F16 conversion on every cache update without changing attention inputs.
+            const bool hip_f16_attention_cache =
+                runtime_->backend_type() == core::BackendType::Hip &&
+                std::getenv("FISH_HIP_F16_ATTN_CACHE") != nullptr;
             const ggml_type cache_type =
-                runtime_->backend_type() == core::BackendType::Vulkan ? GGML_TYPE_F32 : GGML_TYPE_BF16;
+                runtime_->backend_type() == core::BackendType::Vulkan ? GGML_TYPE_F32 :
+                hip_f16_attention_cache ? GGML_TYPE_F16 : GGML_TYPE_BF16;
             for (size_t layer = 0; layer < weights.fast_layers.size(); ++layer) {
                 cache_keys.push_back(core::wrap_tensor(
                     ggml_new_tensor_4d(
