@@ -34,6 +34,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -338,6 +339,64 @@ std::vector<float> build_slow_embeddings(
             }
         }
         std::copy(row.begin(), row.end(), out.begin() + static_cast<std::ptrdiff_t>(step * hidden));
+    }
+    return out;
+}
+
+std::vector<float> build_slow_embeddings_parallel(
+    const FishAudioConfig & config,
+    const FishARWeights & weights,
+    const int32_t * matrix,
+    int64_t steps,
+    int workers) {
+    if (steps <= 0) {
+        return {};
+    }
+    const int64_t rows = config.fast.num_codebooks + 1;
+    const int64_t hidden = config.text.dim;
+    std::vector<float> out(static_cast<size_t>(steps * hidden), 0.0F);
+    const float semantic_scale = 1.0F / std::sqrt(static_cast<float>(rows));
+    const int worker_count = static_cast<int>(
+        std::min<int64_t>(static_cast<int64_t>(std::max(workers, 1)), steps));
+
+    auto run_range = [&](int64_t begin, int64_t end) {
+        std::vector<float> scratch(static_cast<size_t>(hidden), 0.0F);
+        for (int64_t step = begin; step < end; ++step) {
+            float * row = out.data() + static_cast<size_t>(step * hidden);
+            const int32_t token = matrix[step];
+            copy_tensor_row_to_f32(weights.text_embedding_host, token, hidden, row);
+            if (!is_semantic_token(config, token)) {
+                continue;
+            }
+            for (int64_t codebook = 0; codebook < config.fast.num_codebooks; ++codebook) {
+                const int32_t code = matrix[(codebook + 1) * steps + step];
+                copy_tensor_row_to_f32(
+                    weights.codebook_embedding_host,
+                    codebook * config.fast.vocab_size + code,
+                    hidden,
+                    scratch.data());
+                for (int64_t i = 0; i < hidden; ++i) {
+                    row[i] += scratch[static_cast<size_t>(i)];
+                }
+            }
+            for (int64_t i = 0; i < hidden; ++i) {
+                row[i] *= semantic_scale;
+            }
+        }
+    };
+
+    std::vector<std::thread> threads;
+    threads.reserve(static_cast<size_t>(worker_count - 1));
+    const int64_t chunk = (steps + worker_count - 1) / worker_count;
+    int64_t begin = 0;
+    for (int worker = 0; worker + 1 < worker_count; ++worker) {
+        const int64_t end = std::min<int64_t>(steps, begin + chunk);
+        threads.emplace_back(run_range, begin, end);
+        begin = end;
+    }
+    run_range(begin, steps);
+    for (auto & thread : threads) {
+        thread.join();
     }
     return out;
 }
@@ -1027,7 +1086,16 @@ public:
         sample.rng.seed(options.seed);
         sample.previous_main.assign(static_cast<size_t>(kRasWindow), 0);
         auto timing_start = Clock::now();
-        auto embeddings = build_slow_embeddings(assets.config, weights, prompt.matrix.data(), prompt.steps);
+        std::vector<float> embeddings;
+        const bool phase1l_parallel_prefill_embed =
+            runtime_->backend_type() == core::BackendType::Hip &&
+            std::getenv("FISH_PHASE1L_PARALLEL_PREFILL_EMBED") != nullptr;
+        if (phase1l_parallel_prefill_embed) {
+            embeddings = build_slow_embeddings_parallel(
+                assets.config, weights, prompt.matrix.data(), prompt.steps, runtime_->threads());
+        } else {
+            embeddings = build_slow_embeddings(assets.config, weights, prompt.matrix.data(), prompt.steps);
+        }
         profile.slow_embedding_ms += engine::debug::elapsed_ms(timing_start, Clock::now());
         auto prefill = prefill_graph_->run(embeddings, profile);
         std::vector<int32_t> generated_frame_major;
