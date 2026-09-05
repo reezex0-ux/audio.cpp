@@ -145,6 +145,10 @@ modules::QwenDecoderActivationCastPolicy fish_activation_cast_policy(core::Backe
     }
     policy.enabled = true;
     policy.type = GGML_TYPE_BF16;
+    // HIP supports a fused ROUND_BF16 op that is numerically identical to
+    // cast-to-BF16 + cast-back-to-F32, while avoiding the intermediate tensor
+    // and one kernel launch at every activation-rounding boundary.
+    policy.fused_round = backend_type == core::BackendType::Hip;
     policy.after_input_norm = true;
     policy.after_qkv_projection = true;
     policy.after_qk_norm = true;
