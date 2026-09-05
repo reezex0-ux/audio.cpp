@@ -1474,6 +1474,23 @@ private:
 
         int64_t cache_steps() const noexcept { return cache_steps_; }
 
+        void set_logical_cache_steps(int64_t logical_cache_steps) {
+            if (logical_cache_steps < 0 || logical_cache_steps > cache_steps_) {
+                throw std::runtime_error("Fish Audio logical step cache length is invalid");
+            }
+            if (logical_cache_steps > INT32_MAX) {
+                throw std::runtime_error("Fish Audio logical step cache length exceeds FlashAttention op-param range");
+            }
+            const int32_t logical = static_cast<int32_t>(logical_cache_steps);
+            const int node_count = ggml_graph_n_nodes(graph_);
+            for (int i = 0; i < node_count; ++i) {
+                ggml_tensor * node = ggml_graph_node(graph_, i);
+                if (node != nullptr && node->op == GGML_OP_FLASH_ATTN_EXT) {
+                    ggml_flash_attn_ext_set_logical_kv_len(node, logical);
+                }
+            }
+        }
+
         FishPrefillCacheTarget prefill_target_cache() const {
             FishPrefillCacheTarget out;
             out.keys.reserve(runtime_->weights().slow_layers.size());
@@ -2136,12 +2153,21 @@ private:
     }
 
     void ensure_step_graph(int64_t cache_steps, FishARProfile & profile) {
-        if (!step_graph_ || step_graph_->cache_steps() < cache_steps) {
+        const bool phase1m_logical_kv =
+            runtime_->backend_type() == core::BackendType::Hip &&
+            std::getenv("FISH_PHASE1M_LOGICAL_KV") != nullptr;
+        int64_t physical_cache_steps = cache_steps;
+        if (phase1m_logical_kv) {
+            constexpr int64_t kStepCacheBucket = 256;
+            physical_cache_steps = ((cache_steps + kStepCacheBucket - 1) / kStepCacheBucket) * kStepCacheBucket;
+        }
+        if (!step_graph_ || step_graph_->cache_steps() < physical_cache_steps) {
             const auto build_start = Clock::now();
-            step_graph_ = std::make_unique<StepGraph>(runtime_, cache_steps);
+            step_graph_ = std::make_unique<StepGraph>(runtime_, physical_cache_steps);
             prefill_graph_.reset();
             profile.graph_build_step_ms += engine::debug::elapsed_ms(build_start, Clock::now());
         }
+        step_graph_->set_logical_cache_steps(phase1m_logical_kv ? cache_steps : 0);
     }
 
     void ensure_fast_graph(FishARProfile & profile) {

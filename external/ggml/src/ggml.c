@@ -5531,6 +5531,8 @@ struct ggml_tensor * ggml_flash_attn_ext(
 
     float params[] = { scale, max_bias, logit_softcap };
     ggml_set_op_params(result, params, sizeof(params));
+    // Optional backend logical KV length. Zero means use the physical K/V tensor length.
+    ggml_set_op_params_i32(result, 4, 0);
 
     result->op     = GGML_OP_FLASH_ATTN_EXT;
     result->src[0] = q;
@@ -5897,6 +5899,15 @@ void ggml_flash_attn_ext_set_prec(
     const int32_t prec_i32 = (int32_t) prec;
 
     ggml_set_op_params_i32(a, 3, prec_i32); // scale is on first pos, max_bias on second
+}
+
+void ggml_flash_attn_ext_set_logical_kv_len(
+        struct ggml_tensor * a,
+        int32_t              logical_kv_len) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(logical_kv_len >= 0);
+    GGML_ASSERT(logical_kv_len == 0 || logical_kv_len <= a->src[1]->ne[1]);
+    ggml_set_op_params_i32(a, 4, logical_kv_len);
 }
 
 enum ggml_prec ggml_flash_attn_ext_get_prec(

@@ -2587,6 +2587,12 @@ extern "C" {
             struct ggml_tensor * a,
             enum ggml_prec       prec);
 
+    // Optional logical K/V length for attention over a prefix of a larger physical cache.
+    // Zero restores the full physical K/V length.
+    GGML_API void ggml_flash_attn_ext_set_logical_kv_len(
+            struct ggml_tensor * a,
+            int32_t              logical_kv_len);
+
     GGML_API enum ggml_prec ggml_flash_attn_ext_get_prec(
             const struct ggml_tensor * a);
 

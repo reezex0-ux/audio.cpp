@@ -53,7 +53,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
     // across heads. A dense per-head additive bias needs the one-head kernels so
     // each query head reads its own mask slice.
     const bool per_head_mask = mask && mask->ne[2] != 1;
-    bool use_gqa_opt = mask && !per_head_mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    bool use_gqa_opt = mask && !per_head_mask && max_bias == 0.0f && ggml_cuda_fattn_kv_len(KQV) % FATTN_KQ_STRIDE == 0;
     for (const ggml_tensor * t : {Q, K, V, mask}) {
         if (t == nullptr || ggml_is_quantized(t->type)) {
             continue;
@@ -206,7 +206,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
                     break;
                 }
                 if (cc >= GGML_CUDA_CC_BLACKWELL) {
-                    if (Q->ne[1] <= 4 && K->ne[1] >= 65536) {
+                    if (Q->ne[1] <= 4 && ggml_cuda_fattn_kv_len(KQV) >= 65536) {
                         ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<576, 512, 16>(ctx, dst);
                         break;
                     }
@@ -223,7 +223,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
                 }
                 if (cc >= GGML_CUDA_CC_TURING) {
                     if (Q->ne[1] <= 4) {
-                        if (K->ne[1] <= 16384) {
+                        if (ggml_cuda_fattn_kv_len(KQV) <= 16384) {
                             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<576, 512, 16>(ctx, dst);
                             break;
                         }
@@ -367,7 +367,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // carries per-head bias values, shared-mask GQA shortcuts are no longer
     // valid.
     const bool per_head_mask = mask && mask->ne[2] != 1;
-    bool gqa_opt_applies = gqa_ratio >= 2 && mask && !per_head_mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    bool gqa_opt_applies = gqa_ratio >= 2 && mask && !per_head_mask && max_bias == 0.0f && ggml_cuda_fattn_kv_len(KQV) % FATTN_KQ_STRIDE == 0;
     for (const ggml_tensor * t : {Q, K, V, mask}) {
         if (t == nullptr || ggml_is_quantized(t->type)) {
             continue;
@@ -457,13 +457,13 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
-    const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && ggml_cuda_fattn_kv_len(KQV) % FATTN_KQ_STRIDE == 0;
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
         if (can_use_vector_kernel) {
             if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
-                if (cc >= GGML_CUDA_CC_ADA_LOVELACE && Q->ne[1] == 1 && Q->ne[3] == 1 && !(gqa_ratio > 4 && K->ne[1] >= 8192)) {
+                if (cc >= GGML_CUDA_CC_ADA_LOVELACE && Q->ne[1] == 1 && Q->ne[3] == 1 && !(gqa_ratio > 4 && ggml_cuda_fattn_kv_len(KQV) >= 8192)) {
                     return BEST_FATTN_KERNEL_VEC;
                 }
             } else {
@@ -501,7 +501,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     // Use the WMMA kernel if possible:
-    if (ggml_cuda_should_use_wmma_fattn(cc) && K->ne[1] % FATTN_KQ_STRIDE == 0 && Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[0] != 192 && Q->ne[0] != 512 && Q->ne[0] != 576) {
+    if (ggml_cuda_should_use_wmma_fattn(cc) && ggml_cuda_fattn_kv_len(KQV) % FATTN_KQ_STRIDE == 0 && Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[0] != 192 && Q->ne[0] != 512 && Q->ne[0] != 576) {
         if (can_use_vector_kernel && Q->ne[1] <= 2) {
             return BEST_FATTN_KERNEL_VEC;
         }

@@ -1247,7 +1247,7 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
     const bool nvidia = GGML_CUDA_CC_IS_NVIDIA(ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
     const int gqa_limit = nvidia && gqa_ratio <= 4 && DV <= 256 ? 16 : INT_MAX;
     const bool per_head_mask = mask && mask->ne[2] != 1;
-    const bool use_gqa_opt = mask && !per_head_mask && max_bias == 0.0f && Q->ne[1] <= gqa_limit && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    const bool use_gqa_opt = mask && !per_head_mask && max_bias == 0.0f && Q->ne[1] <= gqa_limit && ggml_cuda_fattn_kv_len(KQV) % FATTN_KQ_STRIDE == 0;
 
     if constexpr (DKQ == 320) {
         // This branch is only used for Mistral Small 4 which has a GQA ratio of 32.
