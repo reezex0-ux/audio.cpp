@@ -115,9 +115,18 @@ struct FishARWeights {
     core::TensorValue fast_output;
 };
 
+struct CompactSemanticLogits {
+    std::vector<float> values;
+    int32_t semantic_begin = 0;
+    int32_t semantic_end = -1;
+    int32_t eos_index = -1;
+    size_t source_size = 0;
+};
+
 struct SlowForwardOutput {
     std::vector<float> logits;
     std::vector<float> hidden;
+    std::optional<CompactSemanticLogits> compact_semantic;
 };
 
 struct SlowPrefillOutput {
@@ -540,6 +549,91 @@ SampleDistribution logits_to_distribution(
     return {logits.size(), std::move(kept)};
 }
 
+int32_t compact_semantic_token_id(const CompactSemanticLogits & compact, int32_t local_index) {
+    const int32_t semantic_count = compact.semantic_end - compact.semantic_begin + 1;
+    const bool eos_before = compact.eos_index >= 0 && compact.eos_index < compact.semantic_begin;
+    const bool eos_after = compact.eos_index > compact.semantic_end;
+    if (eos_before) {
+        return local_index == 0 ? compact.eos_index : compact.semantic_begin + local_index - 1;
+    }
+    if (eos_after) {
+        return local_index < semantic_count ? compact.semantic_begin + local_index : compact.eos_index;
+    }
+    return compact.semantic_begin + local_index;
+}
+
+SampleDistribution compact_semantic_to_distribution(
+    const CompactSemanticLogits & compact,
+    float temperature,
+    float top_p,
+    int top_k) {
+    const auto & logits = compact.values;
+    if (logits.empty()) {
+        throw std::runtime_error("Fish Audio compact semantic sampling requires non-empty logits");
+    }
+    std::vector<int32_t> order;
+    order.reserve(logits.size());
+    float max_logit = -std::numeric_limits<float>::infinity();
+    for (size_t i = 0; i < logits.size(); ++i) {
+        const float logit = logits[i];
+        if (!std::isfinite(logit)) {
+            continue;
+        }
+        order.push_back(static_cast<int32_t>(i));
+        max_logit = std::max(max_logit, logit);
+    }
+    double denom = 0.0;
+    for (const int32_t local : order) {
+        denom += std::exp(logits[static_cast<size_t>(local)] - max_logit);
+    }
+    if (denom <= 0.0) {
+        throw std::runtime_error("Fish Audio compact semantic logits produced zero probability mass");
+    }
+    const size_t candidate_count = std::min(order.size(), static_cast<size_t>(std::max(top_k, 1)));
+    const auto by_logit_desc = [&](int32_t lhs, int32_t rhs) {
+        return logits[static_cast<size_t>(lhs)] > logits[static_cast<size_t>(rhs)];
+    };
+    if (candidate_count < order.size()) {
+        std::partial_sort(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(candidate_count), order.end(), by_logit_desc);
+        order.resize(candidate_count);
+    } else {
+        std::sort(order.begin(), order.end(), by_logit_desc);
+    }
+    double cumulative = 0.0;
+    std::vector<int32_t> kept_local;
+    kept_local.reserve(candidate_count);
+    for (size_t i = 0; i < order.size(); ++i) {
+        const int32_t local = order[i];
+        const float logit = logits[static_cast<size_t>(local)];
+        const float prob = static_cast<float>(std::exp(logit - max_logit) / denom);
+        cumulative += prob;
+        const bool remove = cumulative > static_cast<double>(top_p) && i != 0;
+        if (!remove) {
+            kept_local.push_back(local);
+        }
+    }
+    float filtered_max = -std::numeric_limits<float>::infinity();
+    const float temperature_scale = std::max(temperature, 1.0e-5F);
+    for (const int32_t local : kept_local) {
+        filtered_max = std::max(filtered_max, logits[static_cast<size_t>(local)] / temperature_scale);
+    }
+    std::vector<SampleCandidate> kept;
+    kept.reserve(kept_local.size());
+    double filtered_denom = 0.0;
+    for (const int32_t local : kept_local) {
+        const float weight = std::exp(logits[static_cast<size_t>(local)] / temperature_scale - filtered_max);
+        kept.push_back({compact_semantic_token_id(compact, local), weight});
+        filtered_denom += weight;
+    }
+    if (filtered_denom <= 0.0) {
+        throw std::runtime_error("Fish Audio compact semantic sampling filter produced zero probability mass");
+    }
+    for (auto & candidate : kept) {
+        candidate.probability = static_cast<float>(static_cast<double>(candidate.probability) / filtered_denom);
+    }
+    return {compact.source_size, std::move(kept)};
+}
+
 int32_t sample_from_distribution(
     const SampleDistribution & distribution,
     SampleState & state,
@@ -588,6 +682,16 @@ int32_t sample_from_logits(
     const sampling::TorchCudaSamplingPolicy & policy) {
     const auto distribution = logits_to_distribution(logits, temperature, top_p, top_k);
     return sample_from_distribution(distribution, state, policy);
+}
+
+int32_t sample_from_compact_semantic(
+    const CompactSemanticLogits & compact,
+    float temperature,
+    float top_p,
+    int top_k,
+    SampleState & state,
+    const sampling::TorchCudaSamplingPolicy & policy) {
+    return sample_from_distribution(compact_semantic_to_distribution(compact, temperature, top_p, top_k), state, policy);
 }
 
 #ifdef ENGINE_HAS_HIP_FISH_FAST_SAMPLER
@@ -914,7 +1018,7 @@ public:
         auto prefill = prefill_graph_->run(embeddings, profile);
         std::vector<int32_t> generated_frame_major;
         generated_frame_major.reserve(static_cast<size_t>(max_new_tokens * assets.config.fast.num_codebooks));
-        auto frame = sample_frame(prefill.forward.logits, prefill.forward.hidden, options, sample, false, profile);
+        auto frame = sample_frame(prefill.forward, options, sample, false, profile);
         if (frame.front() == im_end_id()) {
             log_profile(profile);
             return engine::codecs::FishDacCodes{{}, assets.config.fast.num_codebooks, 0};
@@ -928,7 +1032,7 @@ public:
             const auto input = build_slow_embedding_for_frame(assets.config, weights, frame);
             profile.slow_embedding_ms += engine::debug::elapsed_ms(timing_start, Clock::now());
             auto step_out = step_graph_->run(input, profile);
-            frame = sample_frame(step_out.logits, step_out.hidden, options, sample, true, profile);
+            frame = sample_frame(step_out, options, sample, true, profile);
             if (frame.front() == im_end_id()) {
                 ended_by_im_end = true;
                 break;
@@ -1259,10 +1363,52 @@ private:
             }
             cache_.advance_after_direct_append(1);
             SlowForwardOutput out;
-            out.logits.resize(static_cast<size_t>(config.vocab_size));
             out.hidden.resize(static_cast<size_t>(config.dim));
             timing_start = Clock::now();
-            ggml_backend_tensor_get(logits_, out.logits.data(), 0, out.logits.size() * sizeof(float));
+#ifdef ENGINE_HAS_HIP_FISH_FAST_SAMPLER
+            const bool compact_semantic =
+                std::getenv("FISH_PHASE1C") != nullptr && runtime_->backend_type() == core::BackendType::Hip;
+            if (compact_semantic) {
+                const auto & fish_config = runtime_->assets().config;
+                const int32_t begin = static_cast<int32_t>(std::max<int64_t>(0, fish_config.semantic_start_token_id));
+                const int32_t end = static_cast<int32_t>(
+                    std::min<int64_t>(config.vocab_size - 1, fish_config.semantic_end_token_id));
+                const int32_t eos = static_cast<int32_t>(fish_config.im_end_token_id);
+                if (end < begin) {
+                    throw std::runtime_error("Fish Audio compact semantic token range is invalid");
+                }
+                const int32_t semantic_count = end - begin + 1;
+                const bool eos_before = eos >= 0 && eos < begin;
+                const bool eos_after = eos > end && eos < config.vocab_size;
+                CompactSemanticLogits compact;
+                compact.semantic_begin = begin;
+                compact.semantic_end = end;
+                compact.eos_index = eos;
+                compact.source_size = static_cast<size_t>(config.vocab_size);
+                compact.values.resize(static_cast<size_t>(semantic_count + ((eos_before || eos_after) ? 1 : 0)));
+                const size_t semantic_offset = static_cast<size_t>(begin) * sizeof(float);
+                if (eos_before) {
+                    ggml_backend_tensor_get(logits_, compact.values.data(), static_cast<size_t>(eos) * sizeof(float), sizeof(float));
+                    ggml_backend_tensor_get(
+                        logits_, compact.values.data() + 1, semantic_offset,
+                        static_cast<size_t>(semantic_count) * sizeof(float));
+                } else {
+                    ggml_backend_tensor_get(
+                        logits_, compact.values.data(), semantic_offset,
+                        static_cast<size_t>(semantic_count) * sizeof(float));
+                    if (eos_after) {
+                        ggml_backend_tensor_get(
+                            logits_, compact.values.data() + semantic_count,
+                            static_cast<size_t>(eos) * sizeof(float), sizeof(float));
+                    }
+                }
+                out.compact_semantic = std::move(compact);
+            } else
+#endif
+            {
+                out.logits.resize(static_cast<size_t>(config.vocab_size));
+                ggml_backend_tensor_get(logits_, out.logits.data(), 0, out.logits.size() * sizeof(float));
+            }
             ggml_backend_tensor_get(hidden_, out.hidden.data(), 0, out.hidden.size() * sizeof(float));
             profile.step_output_read_ms += engine::debug::elapsed_ms(timing_start, Clock::now());
             return out;
@@ -1654,8 +1800,7 @@ private:
     }
 
     std::vector<int32_t> sample_frame(
-        const std::vector<float> & slow_logits,
-        const std::vector<float> & slow_hidden,
+        const SlowForwardOutput & slow_forward,
         const FishAudioGenerationOptions & options,
         SampleState & sample,
         bool apply_ras,
@@ -1663,25 +1808,44 @@ private:
         const auto & config = runtime_->assets().config;
         const auto & weights = runtime_->weights();
         auto timing_start = Clock::now();
-        const auto biased = apply_semantic_bias(config, im_end_id(), slow_logits);
+        std::optional<std::vector<float>> biased;
+        if (!slow_forward.compact_semantic.has_value()) {
+            biased = apply_semantic_bias(config, im_end_id(), slow_forward.logits);
+        }
         profile.sample_bias_ms += engine::debug::elapsed_ms(timing_start, Clock::now());
         timing_start = Clock::now();
-        int32_t main_token = sample_from_logits(
-            biased,
-            options.temperature,
-            options.top_p,
-            options.top_k,
-            sample,
-            sampling_policy_);
+        int32_t main_token = slow_forward.compact_semantic.has_value()
+            ? sample_from_compact_semantic(
+                  *slow_forward.compact_semantic,
+                  options.temperature,
+                  options.top_p,
+                  options.top_k,
+                  sample,
+                  sampling_policy_)
+            : sample_from_logits(
+                  *biased,
+                  options.temperature,
+                  options.top_p,
+                  options.top_k,
+                  sample,
+                  sampling_policy_);
         profile.sample_main_ms += engine::debug::elapsed_ms(timing_start, Clock::now());
         timing_start = Clock::now();
-        const int32_t high_token = sample_from_logits(
-            biased,
-            kRasHighTemperature,
-            kRasHighTopP,
-            options.top_k,
-            sample,
-            sampling_policy_);
+        const int32_t high_token = slow_forward.compact_semantic.has_value()
+            ? sample_from_compact_semantic(
+                  *slow_forward.compact_semantic,
+                  kRasHighTemperature,
+                  kRasHighTopP,
+                  options.top_k,
+                  sample,
+                  sampling_policy_)
+            : sample_from_logits(
+                  *biased,
+                  kRasHighTemperature,
+                  kRasHighTopP,
+                  options.top_k,
+                  sample,
+                  sampling_policy_);
         profile.sample_high_ms += engine::debug::elapsed_ms(timing_start, Clock::now());
         if (apply_ras && is_semantic_token(config, main_token) &&
             std::find(sample.previous_main.begin(), sample.previous_main.end(), main_token) != sample.previous_main.end()) {
@@ -1699,11 +1863,11 @@ private:
         const bool phase1b_fast_path =
             std::getenv("FISH_PHASE1B") != nullptr && runtime_->backend_type() == core::BackendType::Hip;
         if (phase1b_fast_path) {
-            fast_graph_->prime(slow_hidden, profile);
+            fast_graph_->prime(slow_forward.hidden, profile);
         } else
 #endif
         {
-            (void) fast_graph_->run(slow_hidden, 0, profile);
+            (void) fast_graph_->run(slow_forward.hidden, 0, profile);
         }
         int32_t code = std::clamp<int32_t>(
             main_token - static_cast<int32_t>(config.semantic_start_token_id),
