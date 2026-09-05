@@ -4056,6 +4056,56 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    // Fish S2 Phase 1T: exact Q ROPE -> ROUND_BF16 fusion before the existing
+    // PERMUTE -> CONT -> FLASH_ATTN_EXT path. Preserve layout and only remove
+    // the standalone BF16-round kernel.
+    if (getenv("FISH_PHASE1T_Q_ROPE_BF16_FUSION") != nullptr && i + 1 < cgraph->n_nodes) {
+        ggml_tensor * rope  = cgraph->nodes[i];
+        ggml_tensor * round = cgraph->nodes[i + 1];
+        const int mode = rope->op == GGML_OP_ROPE ? ((const int32_t *) rope->op_params)[2] : -1;
+
+        ggml_tensor * permute = nullptr;
+        ggml_tensor * cont = nullptr;
+        ggml_tensor * flash = nullptr;
+        auto find_unique_consumer = [&](ggml_tensor * src, int begin) -> ggml_tensor * {
+            ggml_tensor * found = nullptr;
+            for (int j = begin; j < cgraph->n_nodes; ++j) {
+                ggml_tensor * candidate = cgraph->nodes[j];
+                bool consumes = false;
+                for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                    consumes |= candidate->src[k] == src;
+                }
+                if (consumes) {
+                    if (found != nullptr) {
+                        return nullptr;
+                    }
+                    found = candidate;
+                }
+            }
+            return found;
+        };
+
+        if (rope->op == GGML_OP_ROPE && rope->src[0] != nullptr && rope->src[0]->type == GGML_TYPE_F32 &&
+            rope->type == GGML_TYPE_F32 && rope->src[0]->ne[3] == 1 && mode == GGML_ROPE_TYPE_NORMAL &&
+            round->op == GGML_OP_UNARY && round->src[0] == rope &&
+            ggml_get_unary_op(round) == GGML_UNARY_OP_ROUND_BF16 && round->type == GGML_TYPE_F32 &&
+            ggml_nelements(round) == 4096 && ggml_are_same_shape(rope, round) &&
+            !(rope->flags & GGML_TENSOR_FLAG_OUTPUT) && !(round->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            permute = find_unique_consumer(round, i + 2);
+            if (permute != nullptr && permute->op == GGML_OP_PERMUTE) {
+                cont = find_unique_consumer(permute, i + 2);
+            }
+            if (cont != nullptr && cont->op == GGML_OP_CONT) {
+                flash = find_unique_consumer(cont, i + 2);
+            }
+            if (flash != nullptr && flash->op == GGML_OP_FLASH_ATTN_EXT && flash->src[0] == cont &&
+                ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_ROPE, GGML_OP_UNARY }, { i + 1 })) {
+                ggml_cuda_op_rope_bf16_output_fused(*cuda_ctx, rope, round);
+                return 1;
+            }
+        }
+    }
+
     // Fish S2 Phase 1S: exact K-cache ROPE -> ROUND_BF16 -> VIEW -> SET_ROWS fusion.
     // Preserve the explicit F32->BF16->F32 boundary before writing the accepted F16 cache.
     if (getenv("FISH_PHASE1S_ROPE_BF16_SET_ROWS_FUSION") != nullptr && i + 3 < cgraph->n_nodes) {
