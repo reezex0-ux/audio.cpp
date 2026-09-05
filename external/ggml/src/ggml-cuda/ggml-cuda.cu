@@ -4345,6 +4345,72 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     fused_mul_mat_vec = false;
     fused_node_count  = 0;
 
+    // Fish S2 Phase 1O: the input round is separated from Q8 MMV by a
+    // metadata-only RESHAPE in the real Fish cgraph. Execute the MMV from the
+    // pre-round contiguous F32 buffer and reproduce ROUND_BF16 inside the
+    // dedicated Q8_1 input quantizer. The Q8 reduction/MMV topology is unchanged.
+    if (getenv("FISH_PHASE1O_Q8_INPUT_ROUND_FUSION") != nullptr && i + 2 < cgraph->n_nodes) {
+        ggml_tensor * round_in   = cgraph->nodes[i];
+        ggml_tensor * reshape_in = cgraph->nodes[i + 1];
+        ggml_tensor * mm_node    = cgraph->nodes[i + 2];
+
+        if (round_in->op == GGML_OP_UNARY &&
+            ggml_get_unary_op(round_in) == GGML_UNARY_OP_ROUND_BF16 &&
+            round_in->src[0] && round_in->src[0]->type == GGML_TYPE_F32 &&
+            ggml_is_contiguous(round_in->src[0]) &&
+            reshape_in->op == GGML_OP_RESHAPE && reshape_in->src[0] == round_in &&
+            mm_node->op == GGML_OP_MUL_MAT && mm_node->src[0] && mm_node->src[0]->type == GGML_TYPE_Q8_0 &&
+            mm_node->src[1] == reshape_in && reshape_in->type == GGML_TYPE_F32 &&
+            ggml_nelements(round_in->src[0]) == ggml_nelements(round_in) &&
+            ggml_nelements(round_in) == ggml_nelements(reshape_in) &&
+            ggml_node_get_use_count(cgraph, i) == 1 &&
+            ggml_node_get_use_count(cgraph, i + 1) == 1 &&
+            !(round_in->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+            !(reshape_in->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+            ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
+
+            ggml_cuda_mm_fusion_args_host fusion_data{};
+            fusion_data.round_bf16_input = true;
+            ggml_tensor src1_meta = *reshape_in;
+            src1_meta.data = round_in->src[0]->data;
+            src1_meta.buffer = round_in->src[0]->buffer;
+
+            ggml_tensor * dst_node = mm_node;
+            int nodes_to_skip = 2;
+            int out_nodes[] = { i + 2 };
+            bool memory_ok = ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, out_nodes, 1);
+
+            // Preserve Phase 1N when this MMV itself is followed by
+            // RESHAPE -> ROUND_BF16. This removes both round launches without
+            // changing the MMV reduction order.
+            if (memory_ok && getenv("FISH_PHASE1N_Q8_ROUND_FUSION") != nullptr && i + 4 < cgraph->n_nodes) {
+                ggml_tensor * reshape_out = cgraph->nodes[i + 3];
+                ggml_tensor * round_out   = cgraph->nodes[i + 4];
+                if (reshape_out->op == GGML_OP_RESHAPE && reshape_out->src[0] == mm_node &&
+                    round_out->op == GGML_OP_UNARY && round_out->src[0] == reshape_out &&
+                    ggml_get_unary_op(round_out) == GGML_UNARY_OP_ROUND_BF16 &&
+                    ggml_nelements(mm_node) == ggml_nelements(reshape_out) &&
+                    ggml_nelements(reshape_out) == ggml_nelements(round_out) &&
+                    ggml_node_get_use_count(cgraph, i + 2) == 1 &&
+                    ggml_node_get_use_count(cgraph, i + 3) == 1 &&
+                    !(mm_node->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+                    !(reshape_out->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                    const int out_round[] = { i + 4 };
+                    if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 5, out_round, 1)) {
+                        fusion_data.round_bf16_output = true;
+                        dst_node = round_out;
+                        nodes_to_skip = 4;
+                    }
+                }
+            }
+
+            if (memory_ok) {
+                ggml_cuda_mul_mat_vec_q(*cuda_ctx, mm_node->src[0], &src1_meta, mm_node->src[2], dst_node, &fusion_data);
+                return nodes_to_skip;
+            }
+        }
+    }
+
     // Fish S2 experimental exact fusion: preserve the existing Q8_0 MMV
     // reduction order, but round the final scalar to BF16-valued F32 before
     // storing it. This is numerically identical to a following ROUND_BF16 op
