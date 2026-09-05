@@ -11,10 +11,26 @@
 namespace engine::models::fish_audio::detail {
 namespace {
 
+// Keep this standalone HIP helper independent of ggml include paths. These
+// values are the stable ggml_type ids used by the host side of this build.
+constexpr int32_t kGgmlTypeF32 = 0;
+constexpr int32_t kGgmlTypeF16 = 1;
+constexpr int32_t kGgmlTypeBF16 = 30;
+
 void check_hip(hipError_t status, const char * label) {
     if (status != hipSuccess) {
         throw std::runtime_error(std::string(label) + ": " + hipGetErrorString(status));
     }
+}
+
+size_t slow_embedding_type_size(int32_t type) {
+    if (type == kGgmlTypeF32) {
+        return sizeof(float);
+    }
+    if (type == kGgmlTypeF16 || type == kGgmlTypeBF16) {
+        return sizeof(uint16_t);
+    }
+    throw std::invalid_argument("HIP Fish slow embedding supports only F32/F16/BF16 tables");
 }
 
 struct Workspace {
@@ -26,6 +42,25 @@ struct Workspace {
     float * embeddings = nullptr;
     int32_t embedding_rows = 0;
     int32_t embedding_dim = 0;
+};
+
+constexpr int32_t kMaxSlowCodebooks = 16;
+
+struct SlowFrameArgs {
+    int32_t values[kMaxSlowCodebooks + 1]{};
+};
+
+struct SlowStepWorkspace {
+    void * semantic_text_embeddings = nullptr;
+    void * codebook_embeddings = nullptr;
+    int32_t semantic_text_type = -1;
+    int32_t codebook_type = -1;
+    int32_t semantic_begin = 0;
+    int32_t semantic_rows = 0;
+    int32_t codebook_rows = 0;
+    int32_t codebook_vocab_size = 0;
+    int32_t dim = 0;
+    int32_t num_codebooks = 0;
 };
 
 __device__ __forceinline__ bool better(float av, int32_t ai, float bv, int32_t bi) {
@@ -145,6 +180,111 @@ __global__ void gather_embedding_kernel(
     if (i < dim) {
         output[i] = table[static_cast<size_t>(row) * static_cast<size_t>(dim) + static_cast<size_t>(i)];
     }
+}
+
+__device__ __forceinline__ float fp16_bits_to_float(uint16_t raw) {
+    const uint32_t sign = static_cast<uint32_t>(raw & 0x8000u) << 16;
+    uint32_t exponent = static_cast<uint32_t>((raw >> 10) & 0x1fu);
+    uint32_t mantissa = static_cast<uint32_t>(raw & 0x03ffu);
+    uint32_t out = 0;
+    if (exponent == 0) {
+        if (mantissa == 0) {
+            out = sign;
+        } else {
+            int32_t unbiased = -14;
+            while ((mantissa & 0x0400u) == 0) {
+                mantissa <<= 1;
+                --unbiased;
+            }
+            mantissa &= 0x03ffu;
+            out = sign |
+                  (static_cast<uint32_t>(unbiased + 127) << 23) |
+                  (mantissa << 13);
+        }
+    } else if (exponent == 0x1fu) {
+        out = sign | 0x7f800000u | (mantissa << 13);
+    } else {
+        out = sign | ((exponent + 112u) << 23) | (mantissa << 13);
+    }
+    union {
+        uint32_t u;
+        float f;
+    } bits{};
+    bits.u = out;
+    return bits.f;
+}
+
+__device__ __forceinline__ float load_slow_embedding_value(
+    const void * table,
+    int32_t type,
+    size_t index) {
+    if (type == kGgmlTypeF32) {
+        return static_cast<const float *>(table)[index];
+    }
+    if (type == kGgmlTypeF16) {
+        return fp16_bits_to_float(static_cast<const uint16_t *>(table)[index]);
+    }
+    if (type == kGgmlTypeBF16) {
+        const uint16_t raw = static_cast<const uint16_t *>(table)[index];
+        union {
+            uint32_t u;
+            float f;
+        } bits{};
+        bits.u = static_cast<uint32_t>(raw) << 16;
+        return bits.f;
+    }
+    return 0.0F;
+}
+
+__global__ void build_slow_embedding_kernel(
+    const void * semantic_text_embeddings,
+    int32_t semantic_text_type,
+    int32_t semantic_begin,
+    int32_t semantic_rows,
+    const void * codebook_embeddings,
+    int32_t codebook_type,
+    int32_t codebook_vocab_size,
+    int32_t dim,
+    int32_t num_codebooks,
+    SlowFrameArgs frame,
+    float semantic_scale,
+    int32_t position,
+    int32_t cache_slot,
+    int32_t mask_length,
+    int32_t * device_position,
+    int32_t * device_cache_slot,
+    uint16_t * device_mask,
+    float * output) {
+    const int32_t i = static_cast<int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i == 0) {
+        *device_position = position;
+        *device_cache_slot = cache_slot;
+        if (cache_slot >= 0 && cache_slot < mask_length) {
+            device_mask[cache_slot] = static_cast<uint16_t>(0x0000);
+        }
+    }
+    if (i >= dim) {
+        return;
+    }
+    const int32_t text_row = frame.values[0] - semantic_begin;
+    if (text_row < 0 || text_row >= semantic_rows) {
+        return;
+    }
+    float value = load_slow_embedding_value(
+        semantic_text_embeddings,
+        semantic_text_type,
+        static_cast<size_t>(text_row) * static_cast<size_t>(dim) + static_cast<size_t>(i));
+    // Preserve the CPU reference path's codebook accumulation order exactly.
+    for (int32_t codebook = 0; codebook < num_codebooks; ++codebook) {
+        const int32_t code = frame.values[codebook + 1];
+        const size_t row = static_cast<size_t>(codebook) * static_cast<size_t>(codebook_vocab_size) +
+                           static_cast<size_t>(code);
+        value += load_slow_embedding_value(
+            codebook_embeddings,
+            codebook_type,
+            row * static_cast<size_t>(dim) + static_cast<size_t>(i));
+    }
+    output[i] = value * semantic_scale;
 }
 
 __global__ void chain_prepare_kernel(
@@ -347,6 +487,19 @@ void free_workspace(Workspace * ws) {
     delete ws;
 }
 
+void free_slow_step_workspace(SlowStepWorkspace * ws) {
+    if (ws == nullptr) {
+        return;
+    }
+    if (ws->semantic_text_embeddings != nullptr) {
+        (void) hipFree(ws->semantic_text_embeddings);
+    }
+    if (ws->codebook_embeddings != nullptr) {
+        (void) hipFree(ws->codebook_embeddings);
+    }
+    delete ws;
+}
+
 }  // namespace
 
 void * hip_fast_sampler_create(int32_t vocab_size) {
@@ -442,6 +595,151 @@ void hip_fast_sampler_gather_embedding(
         dim3(blocks), dim3(threads), 0, stream,
         ws->embeddings, ws->embedding_dim, row, device_output);
     check_hip(hipGetLastError(), "gather_embedding_kernel Fish sampler");
+}
+
+void * hip_slow_step_create() {
+    return new SlowStepWorkspace{};
+}
+
+void hip_slow_step_destroy(void * workspace) {
+    free_slow_step_workspace(static_cast<SlowStepWorkspace *>(workspace));
+}
+
+void hip_slow_step_upload_embeddings(
+    void * workspace,
+    const void * host_semantic_text_embeddings,
+    size_t semantic_text_bytes,
+    int32_t semantic_text_type,
+    int32_t semantic_begin,
+    int32_t semantic_rows,
+    const void * host_codebook_embeddings,
+    size_t codebook_bytes,
+    int32_t codebook_type,
+    int32_t codebook_rows,
+    int32_t codebook_vocab_size,
+    int32_t dim,
+    int32_t num_codebooks) {
+    auto * ws = static_cast<SlowStepWorkspace *>(workspace);
+    if (ws == nullptr || host_semantic_text_embeddings == nullptr || host_codebook_embeddings == nullptr ||
+        semantic_rows <= 0 || codebook_rows <= 0 || codebook_vocab_size <= 0 || dim <= 0 ||
+        num_codebooks <= 0 || num_codebooks > kMaxSlowCodebooks ||
+        codebook_rows != codebook_vocab_size * num_codebooks) {
+        throw std::invalid_argument("HIP Fish slow embedding upload received invalid arguments");
+    }
+    const size_t text_value_bytes = slow_embedding_type_size(semantic_text_type);
+    const size_t codebook_value_bytes = slow_embedding_type_size(codebook_type);
+    const size_t expected_text_bytes =
+        static_cast<size_t>(semantic_rows) * static_cast<size_t>(dim) * text_value_bytes;
+    const size_t expected_codebook_bytes =
+        static_cast<size_t>(codebook_rows) * static_cast<size_t>(dim) * codebook_value_bytes;
+    if (semantic_text_bytes != expected_text_bytes || codebook_bytes != expected_codebook_bytes) {
+        throw std::invalid_argument("HIP Fish slow embedding byte size mismatch");
+    }
+    if (ws->semantic_text_embeddings != nullptr) {
+        check_hip(hipFree(ws->semantic_text_embeddings), "hipFree old Fish slow text embedding table");
+        ws->semantic_text_embeddings = nullptr;
+    }
+    if (ws->codebook_embeddings != nullptr) {
+        check_hip(hipFree(ws->codebook_embeddings), "hipFree old Fish slow codebook embedding table");
+        ws->codebook_embeddings = nullptr;
+    }
+    try {
+        check_hip(
+            hipMalloc(&ws->semantic_text_embeddings, semantic_text_bytes),
+            "hipMalloc Fish slow text embedding table");
+        check_hip(
+            hipMalloc(&ws->codebook_embeddings, codebook_bytes),
+            "hipMalloc Fish slow codebook embedding table");
+        check_hip(
+            hipMemcpy(
+                ws->semantic_text_embeddings,
+                host_semantic_text_embeddings,
+                semantic_text_bytes,
+                hipMemcpyHostToDevice),
+            "hipMemcpy Fish slow text embedding table");
+        check_hip(
+            hipMemcpy(ws->codebook_embeddings, host_codebook_embeddings, codebook_bytes, hipMemcpyHostToDevice),
+            "hipMemcpy Fish slow codebook embedding table");
+    } catch (...) {
+        if (ws->semantic_text_embeddings != nullptr) {
+            (void) hipFree(ws->semantic_text_embeddings);
+            ws->semantic_text_embeddings = nullptr;
+        }
+        if (ws->codebook_embeddings != nullptr) {
+            (void) hipFree(ws->codebook_embeddings);
+            ws->codebook_embeddings = nullptr;
+        }
+        throw;
+    }
+    ws->semantic_text_type = semantic_text_type;
+    ws->codebook_type = codebook_type;
+    ws->semantic_begin = semantic_begin;
+    ws->semantic_rows = semantic_rows;
+    ws->codebook_rows = codebook_rows;
+    ws->codebook_vocab_size = codebook_vocab_size;
+    ws->dim = dim;
+    ws->num_codebooks = num_codebooks;
+}
+
+void hip_slow_step_build_embedding(
+    void * workspace,
+    const int32_t * host_frame,
+    int32_t frame_size,
+    float semantic_scale,
+    int32_t position,
+    int32_t cache_slot,
+    int32_t mask_length,
+    int32_t * device_position,
+    int32_t * device_cache_slot,
+    void * device_mask,
+    float * device_output,
+    void * stream_ptr) {
+    auto * ws = static_cast<SlowStepWorkspace *>(workspace);
+    auto stream = static_cast<hipStream_t>(stream_ptr);
+    if (ws == nullptr || ws->semantic_text_embeddings == nullptr || ws->codebook_embeddings == nullptr ||
+        host_frame == nullptr || device_position == nullptr || device_cache_slot == nullptr ||
+        device_mask == nullptr || device_output == nullptr || ws->dim <= 0 || ws->num_codebooks <= 0 ||
+        frame_size != ws->num_codebooks + 1 || position < 0 || cache_slot < 0 ||
+        mask_length <= 0 || cache_slot >= mask_length) {
+        throw std::invalid_argument("HIP Fish slow embedding build received invalid arguments");
+    }
+    const int32_t token = host_frame[0];
+    if (token < ws->semantic_begin || token >= ws->semantic_begin + ws->semantic_rows) {
+        throw std::invalid_argument("HIP Fish slow embedding token is outside the semantic range");
+    }
+    SlowFrameArgs frame{};
+    frame.values[0] = token;
+    for (int32_t codebook = 0; codebook < ws->num_codebooks; ++codebook) {
+        const int32_t code = host_frame[codebook + 1];
+        if (code < 0 || code >= ws->codebook_vocab_size) {
+            throw std::invalid_argument("HIP Fish slow embedding code is out of range");
+        }
+        frame.values[codebook + 1] = code;
+    }
+    constexpr int threads = 256;
+    const int blocks = (ws->dim + threads - 1) / threads;
+    hipLaunchKernelGGL(
+        build_slow_embedding_kernel,
+        dim3(blocks), dim3(threads), 0, stream,
+        ws->semantic_text_embeddings,
+        ws->semantic_text_type,
+        ws->semantic_begin,
+        ws->semantic_rows,
+        ws->codebook_embeddings,
+        ws->codebook_type,
+        ws->codebook_vocab_size,
+        ws->dim,
+        ws->num_codebooks,
+        frame,
+        semantic_scale,
+        position,
+        cache_slot,
+        mask_length,
+        device_position,
+        device_cache_slot,
+        static_cast<uint16_t *>(device_mask),
+        device_output);
+    check_hip(hipGetLastError(), "build_slow_embedding_kernel Fish sampler");
 }
 
 void hip_fast_sampler_prepare_step(

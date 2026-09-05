@@ -1036,12 +1036,24 @@ public:
         append_frame(generated_frame_major, frame);
         ++profile.generated_frames;
         step_graph_->finish_prefill(prompt.steps);
+#ifdef ENGINE_HAS_HIP_FISH_FAST_SAMPLER
+        const bool phase1i_slow_embed =
+            std::getenv("FISH_PHASE1I_SLOW_EMBED") != nullptr && runtime_->backend_type() == core::BackendType::Hip;
+#endif
         bool ended_by_im_end = false;
         for (int64_t step = 1; step < max_new_tokens; ++step) {
-            timing_start = Clock::now();
-            const auto input = build_slow_embedding_for_frame(assets.config, weights, frame);
-            profile.slow_embedding_ms += engine::debug::elapsed_ms(timing_start, Clock::now());
-            auto step_out = step_graph_->run(input, profile);
+            SlowForwardOutput step_out;
+#ifdef ENGINE_HAS_HIP_FISH_FAST_SAMPLER
+            if (phase1i_slow_embed) {
+                step_out = step_graph_->run_frame(frame, profile);
+            } else
+#endif
+            {
+                timing_start = Clock::now();
+                const auto input = build_slow_embedding_for_frame(assets.config, weights, frame);
+                profile.slow_embedding_ms += engine::debug::elapsed_ms(timing_start, Clock::now());
+                step_out = step_graph_->run(input, profile);
+            }
             frame = sample_frame(step_out, options, sample, true, profile);
             if (frame.front() == im_end_id()) {
                 ended_by_im_end = true;
@@ -1308,9 +1320,60 @@ private:
                 throw std::runtime_error("failed to allocate Fish Audio AR step tensors");
             }
             mask_scratch_.assign(static_cast<size_t>(cache_steps_), ggml_fp32_to_fp16(-INFINITY));
+#ifdef ENGINE_HAS_HIP_FISH_FAST_SAMPLER
+            if (runtime_->backend_type() == core::BackendType::Hip &&
+                std::getenv("FISH_PHASE1I_SLOW_EMBED") != nullptr) {
+                hip_slow_step_ = detail::hip_slow_step_create();
+                try {
+                    const auto & fish_config = runtime_->assets().config;
+                    const int32_t semantic_begin = static_cast<int32_t>(fish_config.semantic_start_token_id);
+                    const int32_t semantic_end = static_cast<int32_t>(fish_config.semantic_end_token_id);
+                    if (semantic_end < semantic_begin) {
+                        throw std::runtime_error("Fish Audio slow embedding semantic range is invalid");
+                    }
+                    const int32_t semantic_rows = semantic_end - semantic_begin + 1;
+                    const auto & text_table = runtime_->weights().text_embedding_host;
+                    const size_t text_row_bytes = ggml_row_size(text_table.type, config.dim);
+                    const size_t text_offset = static_cast<size_t>(semantic_begin) * text_row_bytes;
+                    const size_t semantic_text_bytes = static_cast<size_t>(semantic_rows) * text_row_bytes;
+                    if (text_offset + semantic_text_bytes > text_table.bytes.size()) {
+                        throw std::runtime_error("Fish Audio slow semantic embedding slice exceeds tensor storage");
+                    }
+                    const auto & codebook_table = runtime_->weights().codebook_embedding_host;
+                    const int64_t codebook_rows = fish_config.fast.vocab_size * fish_config.fast.num_codebooks;
+                    const size_t expected_codebook_bytes =
+                        static_cast<size_t>(codebook_rows) * ggml_row_size(codebook_table.type, config.dim);
+                    if (expected_codebook_bytes != codebook_table.bytes.size()) {
+                        throw std::runtime_error("Fish Audio slow codebook embedding storage size mismatch");
+                    }
+                    detail::hip_slow_step_upload_embeddings(
+                        hip_slow_step_,
+                        reinterpret_cast<const uint8_t *>(text_table.bytes.data()) + text_offset,
+                        semantic_text_bytes,
+                        static_cast<int32_t>(text_table.type),
+                        semantic_begin,
+                        semantic_rows,
+                        codebook_table.bytes.data(),
+                        codebook_table.bytes.size(),
+                        static_cast<int32_t>(codebook_table.type),
+                        static_cast<int32_t>(codebook_rows),
+                        static_cast<int32_t>(fish_config.fast.vocab_size),
+                        static_cast<int32_t>(config.dim),
+                        static_cast<int32_t>(fish_config.fast.num_codebooks));
+                } catch (...) {
+                    detail::hip_slow_step_destroy(hip_slow_step_);
+                    hip_slow_step_ = nullptr;
+                    throw;
+                }
+            }
+#endif
         }
 
         ~StepGraph() {
+#ifdef ENGINE_HAS_HIP_FISH_FAST_SAMPLER
+            detail::hip_slow_step_destroy(hip_slow_step_);
+            hip_slow_step_ = nullptr;
+#endif
             core::release_backend_graph_resources(runtime_->backend(), graph_);
             if (gallocr_ != nullptr) {
                 ggml_gallocr_free(gallocr_);
@@ -1431,6 +1494,100 @@ private:
             return out;
         }
 
+#ifdef ENGINE_HAS_HIP_FISH_FAST_SAMPLER
+        SlowForwardOutput run_frame(const std::vector<int32_t> & frame, FishARProfile & profile) {
+            const auto & fish_config = runtime_->assets().config;
+            const auto & config = fish_config.text;
+            if (hip_slow_step_ == nullptr || runtime_->backend_type() != core::BackendType::Hip) {
+                throw std::runtime_error("Fish Audio HIP slow embedding path is unavailable");
+            }
+            if (static_cast<int64_t>(frame.size()) != fish_config.fast.num_codebooks + 1) {
+                throw std::runtime_error("Fish Audio slow embedding frame size mismatch");
+            }
+            if (cache_.valid_steps() >= cache_steps_) {
+                throw std::runtime_error("Fish Audio step cache exceeds capacity");
+            }
+            ++profile.step_runs;
+            const int32_t pos = static_cast<int32_t>(cache_.current_end());
+            const int32_t cache_slot = static_cast<int32_t>(cache_.valid_steps());
+            mask_scratch_[static_cast<size_t>(cache_slot)] = ggml_fp32_to_fp16(0.0F);
+
+            auto timing_start = Clock::now();
+            const float semantic_scale =
+                1.0F / std::sqrt(static_cast<float>(fish_config.fast.num_codebooks + 1));
+            detail::hip_slow_step_build_embedding(
+                hip_slow_step_,
+                frame.data(),
+                static_cast<int32_t>(frame.size()),
+                semantic_scale,
+                pos,
+                cache_slot,
+                static_cast<int32_t>(cache_steps_),
+                static_cast<int32_t *>(position_->data),
+                static_cast<int32_t *>(cache_slot_->data),
+                mask_->data,
+                static_cast<float *>(input_->data),
+                ggml_backend_cuda_get_stream(runtime_->backend()));
+            profile.slow_embedding_ms += engine::debug::elapsed_ms(timing_start, Clock::now());
+
+            core::set_backend_threads(runtime_->backend(), runtime_->threads());
+            timing_start = Clock::now();
+            const ggml_status status = core::compute_backend_graph(runtime_->backend(), graph_, nullptr, "fish_audio.ar.step");
+            ggml_backend_synchronize(runtime_->backend());
+            profile.step_graph_ms += engine::debug::elapsed_ms(timing_start, Clock::now());
+            if (status != GGML_STATUS_SUCCESS) {
+                throw std::runtime_error("Fish Audio AR step graph compute failed");
+            }
+            cache_.advance_after_direct_append(1);
+            SlowForwardOutput out;
+            out.hidden.resize(static_cast<size_t>(config.dim));
+            timing_start = Clock::now();
+            const bool compact_semantic =
+                std::getenv("FISH_PHASE1C") != nullptr && runtime_->backend_type() == core::BackendType::Hip;
+            if (compact_semantic) {
+                const int32_t begin = static_cast<int32_t>(std::max<int64_t>(0, fish_config.semantic_start_token_id));
+                const int32_t end = static_cast<int32_t>(
+                    std::min<int64_t>(config.vocab_size - 1, fish_config.semantic_end_token_id));
+                const int32_t eos = static_cast<int32_t>(fish_config.im_end_token_id);
+                if (end < begin) {
+                    throw std::runtime_error("Fish Audio compact semantic token range is invalid");
+                }
+                const int32_t semantic_count = end - begin + 1;
+                const bool eos_before = eos >= 0 && eos < begin;
+                const bool eos_after = eos > end && eos < config.vocab_size;
+                CompactSemanticLogits compact;
+                compact.semantic_begin = begin;
+                compact.semantic_end = end;
+                compact.eos_index = eos;
+                compact.source_size = static_cast<size_t>(config.vocab_size);
+                compact.values.resize(static_cast<size_t>(semantic_count + ((eos_before || eos_after) ? 1 : 0)));
+                const size_t semantic_offset = static_cast<size_t>(begin) * sizeof(float);
+                if (eos_before) {
+                    ggml_backend_tensor_get(logits_, compact.values.data(), static_cast<size_t>(eos) * sizeof(float), sizeof(float));
+                    ggml_backend_tensor_get(
+                        logits_, compact.values.data() + 1, semantic_offset,
+                        static_cast<size_t>(semantic_count) * sizeof(float));
+                } else {
+                    ggml_backend_tensor_get(
+                        logits_, compact.values.data(), semantic_offset,
+                        static_cast<size_t>(semantic_count) * sizeof(float));
+                    if (eos_after) {
+                        ggml_backend_tensor_get(
+                            logits_, compact.values.data() + semantic_count,
+                            static_cast<size_t>(eos) * sizeof(float), sizeof(float));
+                    }
+                }
+                out.compact_semantic = std::move(compact);
+            } else {
+                out.logits.resize(static_cast<size_t>(config.vocab_size));
+                ggml_backend_tensor_get(logits_, out.logits.data(), 0, out.logits.size() * sizeof(float));
+            }
+            ggml_backend_tensor_get(hidden_, out.hidden.data(), 0, out.hidden.size() * sizeof(float));
+            profile.step_output_read_ms += engine::debug::elapsed_ms(timing_start, Clock::now());
+            return out;
+        }
+#endif
+
     private:
         std::shared_ptr<const FishARWeightsRuntime> runtime_;
         int64_t cache_steps_ = 0;
@@ -1447,6 +1604,9 @@ private:
         ggml_cgraph * graph_ = nullptr;
         ggml_gallocr_t gallocr_ = nullptr;
         ggml_backend_buffer_t state_buffer_ = nullptr;
+#ifdef ENGINE_HAS_HIP_FISH_FAST_SAMPLER
+        void * hip_slow_step_ = nullptr;
+#endif
     };
 
     class FastGraph {
